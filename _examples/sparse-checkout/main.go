@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 
-	"github.com/go-git/go-git/v6"
-	. "github.com/go-git/go-git/v6/_examples"
+	"github.com/nobidev/go-git/v6"
+	. "github.com/nobidev/go-git/v6/_examples"
 )
 
 func main() {

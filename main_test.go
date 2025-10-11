@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/go-git/go-git/v6/internal/trace"
+	"github.com/nobidev/go-git/v6/internal/trace"
 )
 
 func TestMain(m *testing.M) {

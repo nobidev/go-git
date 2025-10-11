@@ -10,11 +10,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/plumbing/storer"
-	"github.com/go-git/go-git/v6/utils/ioutil"
-	"github.com/go-git/go-git/v6/utils/sync"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/filemode"
+	"github.com/nobidev/go-git/v6/plumbing/storer"
+	"github.com/nobidev/go-git/v6/utils/ioutil"
+	"github.com/nobidev/go-git/v6/utils/sync"
 )
 
 const (

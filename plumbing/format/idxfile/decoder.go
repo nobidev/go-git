@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/go-git/go-git/v6/utils/binary"
+	"github.com/nobidev/go-git/v6/utils/binary"
 )
 
 var (

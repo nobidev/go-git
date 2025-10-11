@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
+	"github.com/nobidev/go-git/v6/utils/merkletrie/noder"
 )
 
 var (

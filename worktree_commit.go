@@ -9,12 +9,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/plumbing/format/index"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/go-git/go-git/v6/storage"
-	"github.com/go-git/go-git/v6/utils/merkletrie"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/filemode"
+	"github.com/nobidev/go-git/v6/plumbing/format/index"
+	"github.com/nobidev/go-git/v6/plumbing/object"
+	"github.com/nobidev/go-git/v6/storage"
+	"github.com/nobidev/go-git/v6/utils/merkletrie"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"

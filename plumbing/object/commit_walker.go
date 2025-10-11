@@ -5,9 +5,9 @@ import (
 	"errors"
 	"io"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/storer"
-	"github.com/go-git/go-git/v6/storage"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/storer"
+	"github.com/nobidev/go-git/v6/storage"
 )
 
 type commitPreIterator struct {

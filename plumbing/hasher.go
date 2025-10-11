@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"sync"
 
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
+	format "github.com/nobidev/go-git/v6/plumbing/format/config"
 )
 
 // ObjectHasher computes hashes for Git objects. A few differences

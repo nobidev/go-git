@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing"
 )
 
 // DefaultContextLines is the default number of context lines.

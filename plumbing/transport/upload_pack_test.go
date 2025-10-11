@@ -6,11 +6,11 @@ import (
 	"testing"
 
 	fixtures "github.com/go-git/go-git-fixtures/v5"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp/capability"
-	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/cache"
+	"github.com/nobidev/go-git/v6/plumbing/protocol/packp"
+	"github.com/nobidev/go-git/v6/plumbing/protocol/packp/capability"
+	"github.com/nobidev/go-git/v6/storage/filesystem"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )

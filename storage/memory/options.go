@@ -1,6 +1,6 @@
 package memory
 
-import formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
+import formatcfg "github.com/nobidev/go-git/v6/plumbing/format/config"
 
 type options struct {
 	objectFormat formatcfg.ObjectFormat

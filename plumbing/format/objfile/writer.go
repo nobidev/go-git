@@ -6,9 +6,9 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
-	"github.com/go-git/go-git/v6/utils/sync"
+	"github.com/nobidev/go-git/v6/plumbing"
+	format "github.com/nobidev/go-git/v6/plumbing/format/config"
+	"github.com/nobidev/go-git/v6/utils/sync"
 )
 
 var ErrOverflow = errors.New("objfile: declared data length exceeded (overflow)")

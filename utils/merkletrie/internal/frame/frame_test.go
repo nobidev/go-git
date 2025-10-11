@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/go-git/go-git/v6/utils/merkletrie/internal/fsnoder"
-	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
+	"github.com/nobidev/go-git/v6/utils/merkletrie/internal/fsnoder"
+	"github.com/nobidev/go-git/v6/utils/merkletrie/noder"
 	"github.com/stretchr/testify/suite"
 )
 

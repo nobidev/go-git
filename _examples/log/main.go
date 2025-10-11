@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-git/go-git/v6"
-	. "github.com/go-git/go-git/v6/_examples"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/nobidev/go-git/v6"
+	. "github.com/nobidev/go-git/v6/_examples"
+	"github.com/nobidev/go-git/v6/plumbing/object"
+	"github.com/nobidev/go-git/v6/storage/memory"
 )
 
 // Example of how to:

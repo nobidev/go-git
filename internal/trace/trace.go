@@ -4,7 +4,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/go-git/go-git/v6/utils/trace"
+	"github.com/nobidev/go-git/v6/utils/trace"
 )
 
 // envToTarget maps what environment variables can be used

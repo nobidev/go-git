@@ -7,11 +7,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/go-git/go-git/v6"
-	. "github.com/go-git/go-git/v6/_examples"
-	"github.com/go-git/go-git/v6/plumbing/transport"
-	githttp "github.com/go-git/go-git/v6/plumbing/transport/http"
-	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/nobidev/go-git/v6"
+	. "github.com/nobidev/go-git/v6/_examples"
+	"github.com/nobidev/go-git/v6/plumbing/transport"
+	githttp "github.com/nobidev/go-git/v6/plumbing/transport/http"
+	"github.com/nobidev/go-git/v6/storage/memory"
 )
 
 // Here is an example to configure http client according to our own needs.

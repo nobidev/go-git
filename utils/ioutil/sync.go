@@ -3,7 +3,7 @@ package ioutil
 import (
 	"io"
 
-	"github.com/go-git/go-git/v6/utils/sync"
+	"github.com/nobidev/go-git/v6/utils/sync"
 )
 
 // CopyBufferPool calls io.CopyBuffer and uses a buffer from sync.GetByteSlice,

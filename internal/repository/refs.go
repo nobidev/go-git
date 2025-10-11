@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/go-git/go-git/v6/internal/reference"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/object"
-	"github.com/go-git/go-git/v6/plumbing/storer"
-	"github.com/go-git/go-git/v6/storage"
+	"github.com/nobidev/go-git/v6/internal/reference"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/object"
+	"github.com/nobidev/go-git/v6/plumbing/storer"
+	"github.com/nobidev/go-git/v6/storage"
 )
 
 func ExpandRef(s storer.ReferenceStorer, ref plumbing.ReferenceName) (*plumbing.Reference, error) {

@@ -6,12 +6,12 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
-	. "github.com/go-git/go-git/v6/plumbing/format/packfile"
-	"github.com/go-git/go-git/v6/plumbing/storer"
-	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/cache"
+	"github.com/nobidev/go-git/v6/plumbing/format/idxfile"
+	. "github.com/nobidev/go-git/v6/plumbing/format/packfile"
+	"github.com/nobidev/go-git/v6/plumbing/storer"
+	"github.com/nobidev/go-git/v6/storage/filesystem"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/go-git/go-billy/v6/memfs"

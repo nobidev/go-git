@@ -8,10 +8,10 @@ import (
 	"io"
 	"math"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
-	"github.com/go-git/go-git/v6/utils/ioutil"
-	"github.com/go-git/go-git/v6/utils/sync"
+	"github.com/nobidev/go-git/v6/plumbing"
+	format "github.com/nobidev/go-git/v6/plumbing/format/config"
+	"github.com/nobidev/go-git/v6/utils/ioutil"
+	"github.com/nobidev/go-git/v6/utils/sync"
 )
 
 // See https://github.com/git/git/blob/49fa3dc76179e04b0833542fa52d0f287a4955ac/delta.h

@@ -1,7 +1,7 @@
 package packfile
 
 import (
-	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/nobidev/go-git/v6/plumbing/storer"
 )
 
 type ParserOption func(*Parser)

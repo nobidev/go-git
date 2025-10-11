@@ -3,7 +3,7 @@ package packp
 import (
 	"io"
 
-	"github.com/go-git/go-git/v6/plumbing/format/pktline"
+	"github.com/nobidev/go-git/v6/plumbing/format/pktline"
 )
 
 // PushOptions represents a list of update request push-options.

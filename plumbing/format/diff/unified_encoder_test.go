@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/color"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/color"
+	"github.com/nobidev/go-git/v6/plumbing/filemode"
 	"github.com/stretchr/testify/suite"
 )
 

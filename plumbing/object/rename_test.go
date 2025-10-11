@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/filemode"
-	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/filemode"
+	"github.com/nobidev/go-git/v6/storage/memory"
 	"github.com/stretchr/testify/suite"
 )
 

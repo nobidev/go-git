@@ -11,12 +11,12 @@ import (
 	"io"
 	"regexp"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/protocol"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp/capability"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
-	"github.com/go-git/go-git/v6/storage"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/protocol"
+	"github.com/nobidev/go-git/v6/plumbing/protocol/packp"
+	"github.com/nobidev/go-git/v6/plumbing/protocol/packp/capability"
+	"github.com/nobidev/go-git/v6/plumbing/protocol/packp/sideband"
+	"github.com/nobidev/go-git/v6/storage"
 )
 
 const (

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	mindex "github.com/go-git/go-git/v6/utils/merkletrie/index"
-	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
+	mindex "github.com/nobidev/go-git/v6/utils/merkletrie/index"
+	"github.com/nobidev/go-git/v6/utils/merkletrie/noder"
 )
 
 // Status represents the current status of a Worktree.

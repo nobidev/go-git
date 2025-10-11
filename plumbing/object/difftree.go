@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 
-	"github.com/go-git/go-git/v6/utils/merkletrie"
-	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
+	"github.com/nobidev/go-git/v6/utils/merkletrie"
+	"github.com/nobidev/go-git/v6/utils/merkletrie/noder"
 )
 
 // DiffTree compares the content and mode of the blobs found via two

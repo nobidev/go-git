@@ -8,12 +8,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/protocol"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp/capability"
-	"github.com/go-git/go-git/v6/storage/memory"
-	"github.com/go-git/go-git/v6/utils/trace"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/protocol"
+	"github.com/nobidev/go-git/v6/plumbing/protocol/packp"
+	"github.com/nobidev/go-git/v6/plumbing/protocol/packp/capability"
+	"github.com/nobidev/go-git/v6/storage/memory"
+	"github.com/nobidev/go-git/v6/utils/trace"
 	"github.com/stretchr/testify/assert"
 )
 

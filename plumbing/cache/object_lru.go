@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"sync"
 
-	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing"
 )
 
 // ObjectLRU implements an object cache with an LRU eviction policy and a

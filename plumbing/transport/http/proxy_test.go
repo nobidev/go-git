@@ -15,9 +15,9 @@ import (
 
 	"github.com/elazarl/goproxy"
 	fixtures "github.com/go-git/go-git-fixtures/v5"
-	"github.com/go-git/go-git/v6/internal/transport/test"
-	"github.com/go-git/go-git/v6/plumbing/transport"
-	"github.com/go-git/go-git/v6/storage/filesystem"
+	"github.com/nobidev/go-git/v6/internal/transport/test"
+	"github.com/nobidev/go-git/v6/plumbing/transport"
+	"github.com/nobidev/go-git/v6/storage/filesystem"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"

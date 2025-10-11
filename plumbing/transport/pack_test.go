@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/go-git/go-git/v6/utils/ioutil"
+	"github.com/nobidev/go-git/v6/utils/ioutil"
 	"github.com/stretchr/testify/suite"
 )
 

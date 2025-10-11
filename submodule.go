@@ -8,10 +8,10 @@ import (
 	"path"
 
 	"github.com/go-git/go-billy/v6"
-	"github.com/go-git/go-git/v6/config"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/format/index"
-	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/nobidev/go-git/v6/config"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/format/index"
+	"github.com/nobidev/go-git/v6/plumbing/transport"
 )
 
 var (

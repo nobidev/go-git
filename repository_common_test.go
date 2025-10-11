@@ -4,11 +4,11 @@ import (
 	"testing"
 	"time"
 
-	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
+	formatcfg "github.com/nobidev/go-git/v6/plumbing/format/config"
 	"github.com/stretchr/testify/require"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/object"
 )
 
 func forEachFormat(t *testing.T, fnT func(*testing.T, formatcfg.ObjectFormat)) {

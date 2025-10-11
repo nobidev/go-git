@@ -5,9 +5,9 @@ import (
 	"hash"
 	"os"
 
-	"github.com/go-git/go-git/v6/plumbing/format/index"
-	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
-	"github.com/go-git/go-git/v6/utils/ioutil"
+	"github.com/nobidev/go-git/v6/plumbing/format/index"
+	"github.com/nobidev/go-git/v6/storage/filesystem/dotgit"
+	"github.com/nobidev/go-git/v6/utils/ioutil"
 )
 
 type IndexStorage struct {

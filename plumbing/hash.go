@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strconv"
 
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
+	format "github.com/nobidev/go-git/v6/plumbing/format/config"
 )
 
 // Hash SHA1 hashed content

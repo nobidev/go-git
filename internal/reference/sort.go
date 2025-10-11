@@ -3,7 +3,7 @@ package reference
 import (
 	"sort"
 
-	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing"
 )
 
 // Sort sorts the references by name to ensure a consistent order.

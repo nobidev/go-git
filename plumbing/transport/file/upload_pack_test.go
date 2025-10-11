@@ -5,11 +5,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/go-git/go-git/v6/internal/transport/test"
-	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/plumbing/transport"
-	"github.com/go-git/go-git/v6/storage/filesystem"
-	"github.com/go-git/go-git/v6/storage/memory"
+	"github.com/nobidev/go-git/v6/internal/transport/test"
+	"github.com/nobidev/go-git/v6/plumbing/cache"
+	"github.com/nobidev/go-git/v6/plumbing/transport"
+	"github.com/nobidev/go-git/v6/storage/filesystem"
+	"github.com/nobidev/go-git/v6/storage/memory"
 	"github.com/stretchr/testify/suite"
 
 	fixtures "github.com/go-git/go-git-fixtures/v5"

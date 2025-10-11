@@ -4,8 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/storer"
 )
 
 type PruneHandler func(unreferencedObjectHash plumbing.Hash) error

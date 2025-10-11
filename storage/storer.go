@@ -3,8 +3,8 @@ package storage
 import (
 	"errors"
 
-	"github.com/go-git/go-git/v6/config"
-	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/nobidev/go-git/v6/config"
+	"github.com/nobidev/go-git/v6/plumbing/storer"
 )
 
 var ErrReferenceHasChanged = errors.New("reference has changed concurrently")

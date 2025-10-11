@@ -5,9 +5,9 @@ import (
 	"io"
 	"math"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/hash"
-	"github.com/go-git/go-git/v6/utils/binary"
+	"github.com/nobidev/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6/plumbing/hash"
+	"github.com/nobidev/go-git/v6/utils/binary"
 )
 
 // Encoder writes MemoryIndex structs to an output stream.

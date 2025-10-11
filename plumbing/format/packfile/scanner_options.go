@@ -3,8 +3,8 @@ package packfile
 import (
 	"bufio"
 
-	"github.com/go-git/go-git/v6/plumbing"
-	format "github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/nobidev/go-git/v6/plumbing"
+	format "github.com/nobidev/go-git/v6/plumbing/format/config"
 )
 
 type ScannerOption func(*Scanner)

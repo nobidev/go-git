@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/go-git/go-git/v6"
-	. "github.com/go-git/go-git/v6/_examples"
-	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/nobidev/go-git/v6"
+	. "github.com/nobidev/go-git/v6/_examples"
+	"github.com/nobidev/go-git/v6/plumbing"
 )
 
 // Example how to resolve a revision into its commit counterpart
