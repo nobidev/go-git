@@ -48,6 +48,13 @@ type EncodedObjectStorer interface {
 	AddAlternate(remote string) error
 }
 
+type EncodedObjectStorerWithHooks interface {
+	EncodedObjectStorer
+	StartObjects(count uint32) error
+	OnObject(objectType plumbing.ObjectType, hash plumbing.Hash, size int64) error
+	StopObjects(h plumbing.Hash) error
+}
+
 // DeltaObjectStorer is an EncodedObjectStorer that can return delta
 // objects.
 type DeltaObjectStorer interface {
