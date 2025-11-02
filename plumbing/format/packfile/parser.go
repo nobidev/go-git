@@ -144,7 +144,9 @@ func (p *Parser) Parse() (plumbing.Hash, error) {
 			header := data.Value().(Header)
 
 			p.resetCache(int(header.ObjectsQty))
-			p.onHeader(header.ObjectsQty)
+			if err := p.onHeader(header.ObjectsQty); err != nil {
+				return plumbing.ZeroHash, err
+			}
 
 		case ObjectSection:
 			oh := data.Value().(ObjectHeader)
@@ -371,6 +373,11 @@ func (p *Parser) forEachObserver(f func(o Observer) error) error {
 }
 
 func (p *Parser) onHeader(count uint32) error {
+	if hooks, ok := p.storage.(storer.EncodedObjectStorerWithHooks); ok {
+		if err := hooks.StartObjects(count); err != nil {
+			return err
+		}
+	}
 	return p.forEachObserver(func(o Observer) error {
 		return o.OnHeader(count)
 	})
@@ -398,6 +405,11 @@ func (p *Parser) onInflatedObjectContent(
 }
 
 func (p *Parser) onFooter(h plumbing.Hash) error {
+	if hooks, ok := p.storage.(storer.EncodedObjectStorerWithHooks); ok {
+		if err := hooks.StopObjects(h); err != nil {
+			return err
+		}
+	}
 	return p.forEachObserver(func(o Observer) error {
 		return o.OnFooter(h)
 	})
