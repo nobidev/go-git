@@ -612,6 +612,90 @@ func TestMerge(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "src nil map preserves dst map",
+			input: []*Config{
+				{
+					Remotes: map[string]*RemoteConfig{
+						"origin": {Name: "origin", URLs: []string{"https://example.com/repo.git"}},
+					},
+				},
+				{
+					// Remotes is nil (zero value)
+					Branches: map[string]*Branch{
+						"main": {Name: "main"},
+					},
+				},
+			},
+			want: Config{
+				Remotes: map[string]*RemoteConfig{
+					"origin": {Name: "origin", URLs: []string{"https://example.com/repo.git"}},
+				},
+				Branches: map[string]*Branch{
+					"main": {Name: "main"},
+				},
+			},
+		},
+		{
+			name: "src empty map preserves dst map",
+			input: []*Config{
+				{
+					Remotes: map[string]*RemoteConfig{
+						"origin": {Name: "origin", URLs: []string{"https://example.com/repo.git"}},
+					},
+				},
+				{
+					// Remotes is explicitly initialised but empty (mirrors NewConfig behaviour).
+					Remotes: map[string]*RemoteConfig{},
+				},
+			},
+			want: Config{
+				Remotes: map[string]*RemoteConfig{
+					"origin": {Name: "origin", URLs: []string{"https://example.com/repo.git"}},
+				},
+			},
+		},
+		{
+			name: "merge maps with disjoint keys",
+			input: []*Config{
+				{
+					Remotes: map[string]*RemoteConfig{
+						"origin": {Name: "origin", URLs: []string{"https://example.com/repo.git"}},
+					},
+				},
+				{
+					Remotes: map[string]*RemoteConfig{
+						"upstream": {Name: "upstream", URLs: []string{"https://upstream.com/repo.git"}},
+					},
+				},
+			},
+			want: Config{
+				Remotes: map[string]*RemoteConfig{
+					"origin":   {Name: "origin", URLs: []string{"https://example.com/repo.git"}},
+					"upstream": {Name: "upstream", URLs: []string{"https://upstream.com/repo.git"}},
+				},
+			},
+		},
+		{
+			name: "src map entry overrides dst map entry",
+			input: []*Config{
+				{
+					Remotes: map[string]*RemoteConfig{
+						"origin": {Name: "origin", URLs: []string{"https://old.com/repo.git"}},
+					},
+				},
+				{
+					Remotes: map[string]*RemoteConfig{
+						"origin": {Name: "origin", URLs: []string{"https://new.com/repo.git"}},
+					},
+				},
+			},
+			want: Config{
+				Remotes: map[string]*RemoteConfig{
+					"origin": {Name: "origin", URLs: []string{"https://new.com/repo.git"}},
+				},
+			},
+		},
 	}
 
 	for _, tc := range tests {

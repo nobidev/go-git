@@ -216,6 +216,21 @@ func merge(dst, src any) {
 				df.Set(sf)
 			}
 
+		case reflect.Map:
+			// An empty (but non-nil) src map must not overwrite dst entries.
+			// Only copy individual entries from src so that dst keys not
+			// present in src are preserved and src entries override same-key
+			// dst entries.
+			if sf.Len() == 0 {
+				continue
+			}
+			if df.IsNil() {
+				df.Set(reflect.MakeMap(df.Type()))
+			}
+			for _, key := range sf.MapKeys() {
+				df.SetMapIndex(key, sf.MapIndex(key))
+			}
+
 		default:
 			df.Set(sf)
 		}
