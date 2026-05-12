@@ -180,6 +180,53 @@ func TestReaderFromDeltaRejectsOversizedCopies(t *testing.T) {
 		"ReaderFromDelta yielded more bytes than the declared target size")
 }
 
+func TestReaderFromDeltaBaseReaderCapabilities(t *testing.T) {
+	t.Parallel()
+
+	base := &plumbing.MemoryObject{}
+	_, _ = base.Write([]byte("0123456789"))
+
+	reader, err := base.Reader()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reader.Close()) }()
+
+	_, ok := reader.(io.ReaderAt)
+	require.True(t, ok, "MemoryObject reader must support random access")
+
+	_, ok = reader.(io.Seeker)
+	require.True(t, ok, "MemoryObject reader must support seeking")
+
+	for _, tc := range []struct {
+		name string
+		obj  plumbing.EncodedObject
+	}{
+		{
+			name: "memory reader-at",
+			obj:  base,
+		},
+		{
+			name: "reopen fallback",
+			obj:  readOnlyObject{content: []byte("0123456789")},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			delta := buildDelta(10, 6,
+				encodeCopyOperation(5, 2),
+				encodeCopyOperation(0, 4),
+			)
+			rc, err := ReaderFromDelta(tc.obj, bytes.NewReader(delta))
+			require.NoError(t, err)
+
+			out, err := io.ReadAll(rc)
+			require.NoError(t, err)
+			require.NoError(t, rc.Close())
+			assert.Equal(t, []byte("560123"), out)
+		})
+	}
+}
+
 // TestPatchDeltaRejectsTrailingBytes asserts that a delta whose
 // operations exactly fill the declared target size but is followed by
 // extra bytes is rejected, matching upstream's `data != top` post-loop
@@ -210,4 +257,34 @@ func TestPatchDeltaAcceptsEmptyTarget(t *testing.T) {
 	out, err := PatchDelta(src, delta)
 	assert.NoError(t, err)
 	assert.Empty(t, out)
+}
+
+type readOnlyObject struct {
+	content []byte
+}
+
+func (o readOnlyObject) Hash() plumbing.Hash {
+	return plumbing.ZeroHash
+}
+
+func (o readOnlyObject) Type() plumbing.ObjectType {
+	return plumbing.BlobObject
+}
+
+func (o readOnlyObject) SetType(plumbing.ObjectType) {
+}
+
+func (o readOnlyObject) Size() int64 {
+	return int64(len(o.content))
+}
+
+func (o readOnlyObject) SetSize(int64) {
+}
+
+func (o readOnlyObject) Reader() (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(o.content)), nil
+}
+
+func (o readOnlyObject) Writer() (io.WriteCloser, error) {
+	return nil, io.ErrClosedPipe
 }

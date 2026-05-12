@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	format "github.com/go-git/go-git/v6/plumbing/format/config"
@@ -109,6 +108,11 @@ func PatchDelta(src, delta []byte) ([]byte, error) {
 
 // ReaderFromDelta returns a reader that applies a delta to a base object.
 func ReaderFromDelta(base plumbing.EncodedObject, deltaRC io.Reader) (io.ReadCloser, error) {
+	baseSize := base.Size()
+	if baseSize < 0 {
+		return nil, ErrInvalidDelta
+	}
+
 	deltaBuf := bufio.NewReaderSize(deltaRC, 1024)
 	srcSz, err := packutil.DecodeLEB128FromReader(deltaBuf)
 	if err != nil {
@@ -117,7 +121,7 @@ func ReaderFromDelta(base plumbing.EncodedObject, deltaRC io.Reader) (io.ReadClo
 		}
 		return nil, err
 	}
-	if srcSz != uint(base.Size()) {
+	if srcSz != uint(baseSize) {
 		return nil, ErrInvalidDelta
 	}
 
@@ -140,8 +144,8 @@ func ReaderFromDelta(base plumbing.EncodedObject, deltaRC io.Reader) (io.ReadClo
 		}
 		defer func() { _ = baseRd.Close() }()
 
-		baseBuf := bufio.NewReader(baseRd)
-		basePos := uint(0)
+		baseAt, _ := baseRd.(io.ReaderAt)
+		baseSeek, _ := baseRd.(io.Seeker)
 
 		for remainingTargetSz > 0 {
 			cmd, err := deltaBuf.ReadByte()
@@ -173,41 +177,24 @@ func ReaderFromDelta(base plumbing.EncodedObject, deltaRC io.Reader) (io.ReadClo
 					return
 				}
 
-				discard := offset - basePos
-				if basePos > offset {
-					_ = baseRd.Close()
-					baseRd, err = base.Reader()
-					if err != nil {
-						_ = dstWr.CloseWithError(ErrInvalidDelta)
-						return
-					}
-					baseBuf.Reset(baseRd)
-					discard = offset
-				}
-				for discard > math.MaxInt32 {
-					n, err := baseBuf.Discard(math.MaxInt32)
-					if err != nil {
-						_ = dstWr.CloseWithError(err)
-						return
-					}
-					basePos += uint(n)
-					discard -= uint(n)
-				}
-				for discard > 0 {
-					n, err := baseBuf.Discard(int(discard))
-					if err != nil {
-						_ = dstWr.CloseWithError(err)
-						return
-					}
-					basePos += uint(n)
-					discard -= uint(n)
-				}
-				if _, err := ioutil.CopyBufferPool(dstWr, io.LimitReader(baseBuf, int64(sz))); err != nil {
+				src, closeSrc, err := baseRangeReader(base, baseRd, baseAt, baseSeek, offset, sz)
+				if err != nil {
 					_ = dstWr.CloseWithError(err)
 					return
 				}
+				n, err := ioutil.CopyBufferPool(dstWr, src)
+				if closeSrc != nil {
+					_ = closeSrc.Close()
+				}
+				if err != nil {
+					_ = dstWr.CloseWithError(err)
+					return
+				}
+				if uint(n) != sz {
+					_ = dstWr.CloseWithError(ErrInvalidDelta)
+					return
+				}
 				remainingTargetSz -= sz
-				basePos += sz
 
 			case isCopyFromDelta(cmd):
 				sz := uint(cmd) // cmd is the size itself
@@ -215,8 +202,13 @@ func ReaderFromDelta(base plumbing.EncodedObject, deltaRC io.Reader) (io.ReadClo
 					_ = dstWr.CloseWithError(ErrInvalidDelta)
 					return
 				}
-				if _, err := ioutil.CopyBufferPool(dstWr, io.LimitReader(deltaBuf, int64(sz))); err != nil {
+				n, err := ioutil.CopyBufferPool(dstWr, io.LimitReader(deltaBuf, int64(sz)))
+				if err != nil {
 					_ = dstWr.CloseWithError(err)
+					return
+				}
+				if uint(n) != sz {
+					_ = dstWr.CloseWithError(ErrInvalidDelta)
 					return
 				}
 
@@ -242,6 +234,30 @@ func ReaderFromDelta(base plumbing.EncodedObject, deltaRC io.Reader) (io.ReadClo
 	}()
 
 	return dstRd, nil
+}
+
+func baseRangeReader(base plumbing.EncodedObject, r io.Reader, ra io.ReaderAt, seeker io.Seeker, offset, size uint) (io.Reader, io.Closer, error) {
+	if ra != nil {
+		return io.NewSectionReader(ra, int64(offset), int64(size)), nil, nil
+	}
+
+	if seeker != nil {
+		if _, err := seeker.Seek(int64(offset), io.SeekStart); err != nil {
+			return nil, nil, err
+		}
+		return io.LimitReader(r, int64(size)), nil, nil
+	}
+
+	rc, err := base.Reader()
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := io.CopyN(io.Discard, rc, int64(offset)); err != nil {
+		_ = rc.Close()
+		return nil, nil, err
+	}
+
+	return io.LimitReader(rc, int64(size)), rc, nil
 }
 
 func patchDelta(dst *bytes.Buffer, src, delta []byte) error {
