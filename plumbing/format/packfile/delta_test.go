@@ -237,3 +237,76 @@ func FuzzPatchDelta(f *testing.F) {
 		PatchDelta(input1, input2)
 	})
 }
+
+func FuzzDeltaRoundTrip(f *testing.F) {
+	f.Add([]byte("some value"), []byte("somenewvalue"))
+	f.Add([]byte("aaaaaaaaaaaaaaaa"), []byte("aaaaaaaabaaaaaaa"))
+	f.Add([]byte("base"), []byte{})
+
+	f.Fuzz(func(t *testing.T, baseData, targetData []byte) {
+		if len(baseData) == 0 || len(baseData) > 4096 || len(targetData) > 4096 {
+			return
+		}
+
+		base := &plumbing.MemoryObject{}
+		base.SetType(plumbing.BlobObject)
+		w, err := base.Writer()
+		if err != nil {
+			t.Fatalf("base writer: %v", err)
+		}
+		if _, err := w.Write(baseData); err != nil {
+			t.Fatalf("write base: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("close base: %v", err)
+		}
+
+		target := &plumbing.MemoryObject{}
+		target.SetType(plumbing.BlobObject)
+		w, err = target.Writer()
+		if err != nil {
+			t.Fatalf("target writer: %v", err)
+		}
+		if _, err := w.Write(targetData); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("close target: %v", err)
+		}
+
+		delta, err := GetDelta(base, target)
+		if err != nil {
+			t.Fatalf("get delta: %v", err)
+		}
+		r, err := delta.Reader()
+		if err != nil {
+			t.Fatalf("delta reader: %v", err)
+		}
+		deltaData, err := io.ReadAll(r)
+		_ = r.Close()
+		if err != nil {
+			t.Fatalf("read delta: %v", err)
+		}
+
+		got, err := PatchDelta(baseData, deltaData)
+		if err != nil {
+			t.Fatalf("patch delta: %v", err)
+		}
+		if !bytes.Equal(got, targetData) {
+			t.Fatalf("patched delta content mismatch")
+		}
+
+		rc, err := ReaderFromDelta(base, bytes.NewReader(deltaData))
+		if err != nil {
+			t.Fatalf("reader from delta: %v", err)
+		}
+		streamed, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			t.Fatalf("read streamed delta: %v", err)
+		}
+		if !bytes.Equal(streamed, targetData) {
+			t.Fatalf("streamed delta content mismatch")
+		}
+	})
+}

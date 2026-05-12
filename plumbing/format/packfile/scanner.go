@@ -10,6 +10,7 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"math"
 	"sync"
 
 	"github.com/go-git/go-git/v6/plumbing"
@@ -228,7 +229,7 @@ func (r *Scanner) WriteObject(oh *ObjectHeader, writer io.Writer) error {
 		return plumbing.ErrObjectNotFound
 	}
 
-	err := r.inflateContent(oh.ContentOffset, writer)
+	err := r.inflateContent(oh.ContentOffset, oh.Size, writer)
 	if err != nil {
 		return ErrReferenceDeltaNotFound
 	}
@@ -236,7 +237,7 @@ func (r *Scanner) WriteObject(oh *ObjectHeader, writer io.Writer) error {
 	return nil
 }
 
-func (r *Scanner) inflateContent(contentOffset int64, writer io.Writer) error {
+func (r *Scanner) inflateContent(contentOffset, size int64, writer io.Writer) error {
 	_, err := r.Seek(contentOffset, io.SeekStart)
 	if err != nil {
 		return err
@@ -248,8 +249,26 @@ func (r *Scanner) inflateContent(contentOffset int64, writer io.Writer) error {
 	}
 	defer gogitsync.PutZlibReader(zr)
 
-	_, err = ioutil.CopyBufferPool(writer, zr)
-	return err
+	return copyObjectContent(writer, zr, size)
+}
+
+func copyObjectContent(writer io.Writer, reader io.Reader, size int64) error {
+	if size < 0 {
+		return fmt.Errorf("%w: negative object size", ErrMalformedPackfile)
+	}
+	if size == math.MaxInt64 {
+		return fmt.Errorf("%w: object size is too large", ErrMalformedPackfile)
+	}
+
+	n, err := ioutil.CopyBufferPool(writer, io.LimitReader(reader, size+1))
+	if err != nil {
+		return err
+	}
+	if n > size {
+		return fmt.Errorf("%w: inflated object exceeds declared size", ErrMalformedPackfile)
+	}
+
+	return nil
 }
 
 // scan goes through the next stateFn.
@@ -373,6 +392,9 @@ func objectEntry(r *Scanner) (stateFn, error) {
 		}
 		return nil, err
 	}
+	if size > math.MaxInt64 {
+		return nil, fmt.Errorf("%w: object size is too large", ErrMalformedPackfile)
+	}
 
 	oh := ObjectHeader{
 		Offset:   offset,
@@ -439,8 +461,7 @@ func objectEntry(r *Scanner) (stateFn, error) {
 		mw = io.MultiWriter(mw, oh.content)
 	}
 
-	_, err = ioutil.CopyBufferPool(mw, zr)
-	if err != nil {
+	if err := copyObjectContent(mw, zr, oh.Size); err != nil {
 		return nil, err
 	}
 

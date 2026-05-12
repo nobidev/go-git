@@ -89,6 +89,23 @@ func TestScannerRejectsReservedObjectType(t *testing.T) {
 	require.ErrorContains(t, scanner.Error(), "invalid object type")
 }
 
+func TestScannerRejectsInflatedObjectLargerThanDeclared(t *testing.T) {
+	t.Parallel()
+
+	pack, _ := buildTestPack(t, testPackObject{
+		typ:          plumbing.BlobObject,
+		declaredSize: 1,
+		content:      bytes.Repeat([]byte("a"), 1024),
+	})
+	scanner := NewScanner(bytes.NewReader(pack))
+
+	for scanner.Scan() {
+	}
+
+	require.ErrorIs(t, scanner.Error(), ErrMalformedPackfile)
+	require.ErrorContains(t, scanner.Error(), "inflated object exceeds declared size")
+}
+
 func BenchmarkScannerBasic(b *testing.B) {
 	f := mustPackfile(b, fixtures.Basic().One())
 	scanner := NewScanner(f)

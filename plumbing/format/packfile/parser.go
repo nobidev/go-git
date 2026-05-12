@@ -33,6 +33,10 @@ var (
 // dynamically as data is written; this is purely a hint cap.
 const maxObjectPreallocBytes = 1 << 30 // 1 GiB
 
+// Match upstream Git's pack depth ceiling: pack-objects.h OE_DEPTH_BITS,
+// enforced in builtin/pack-objects.c as (1 << OE_DEPTH_BITS) - 1.
+const maxDeltaChainDepth = 4095
+
 // growHint returns a non-negative int64 size, clamped to a sane upper bound,
 // suitable for passing to bytes.Buffer.Grow.
 func growHint(n int64) int {
@@ -252,7 +256,7 @@ func (p *Parser) ensureContent(oh *ObjectHeader) error {
 		deltaData := sync.GetBytesBuffer()
 		defer sync.PutBytesBuffer(deltaData)
 
-		err = p.scanner.inflateContent(oh.ContentOffset, deltaData)
+		err = p.scanner.inflateContent(oh.ContentOffset, oh.Size, deltaData)
 		if err != nil {
 			return fmt.Errorf("inflating content at offset %v: %w", oh.ContentOffset, err)
 		}
@@ -297,11 +301,31 @@ func (p *Parser) processDelta(oh *ObjectHeader) error {
 		return fmt.Errorf("unsupported delta type: %v", oh.Type)
 	}
 
+	if err := checkDeltaChainDepth(oh); err != nil {
+		return err
+	}
+
 	if err := p.ensureContent(oh); err != nil {
 		return err
 	}
 
 	return p.storeOrCache(oh)
+}
+
+func checkDeltaChainDepth(oh *ObjectHeader) error {
+	var depth int
+	for current := oh; current != nil && current.isDeltaOnDisk(); current = current.parent {
+		depth++
+		if depth > maxDeltaChainDepth {
+			return fmt.Errorf("%w: delta chain depth exceeds %d", ErrMalformedPackfile, maxDeltaChainDepth)
+		}
+	}
+
+	return nil
+}
+
+func (oh *ObjectHeader) isDeltaOnDisk() bool {
+	return oh.Type.IsDelta() || oh.diskType.IsDelta()
 }
 
 // parentReader returns a [io.ReaderAt] for the decompressed contents
@@ -330,7 +354,7 @@ func (p *Parser) parentReader(parent *ObjectHeader) (io.ReaderAt, error) {
 				}
 				parent.content.Grow(growHint(parent.Size))
 
-				_, err = ioutil.CopyBufferPool(parent.content, r)
+				err = copyObjectContent(parent.content, r, parent.Size)
 				if err == nil {
 					return bytes.NewReader(parent.content.Bytes()), nil
 				}
@@ -355,7 +379,7 @@ func (p *Parser) parentReader(parent *ObjectHeader) (io.ReaderAt, error) {
 	}
 	parent.content.Grow(growHint(parent.Size))
 
-	err := p.scanner.inflateContent(parent.ContentOffset, parent.content)
+	err := p.scanner.inflateContent(parent.ContentOffset, parent.Size, parent.content)
 	if err != nil {
 		return nil, ErrReferenceDeltaNotFound
 	}

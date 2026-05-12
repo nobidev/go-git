@@ -250,6 +250,9 @@ func (p *Packfile) headerFromOffset(offset int64) (*ObjectHeader, error) {
 	}
 
 	if !p.scanner.Scan() {
+		if err := p.scanner.Error(); err != nil {
+			return nil, err
+		}
 		return nil, plumbing.ErrObjectNotFound
 	}
 
@@ -318,7 +321,7 @@ func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, er
 
 	switch oh.Type {
 	case plumbing.CommitObject, plumbing.TreeObject, plumbing.BlobObject, plumbing.TagObject:
-		err = p.scanner.inflateContent(oh.ContentOffset, w)
+		err = p.scanner.inflateContent(oh.ContentOffset, oh.Size, w)
 
 	case plumbing.REFDeltaObject, plumbing.OFSDeltaObject:
 		var parent plumbing.EncodedObject
@@ -344,7 +347,7 @@ func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, er
 		// duplicate copy of the delta payload.
 		if oh.content == nil {
 			oh.content = gogitsync.GetBytesBuffer()
-			err = p.scanner.inflateContent(oh.ContentOffset, oh.content)
+			err = p.scanner.inflateContent(oh.ContentOffset, oh.Size, oh.content)
 			if err != nil {
 				return nil, fmt.Errorf("cannot inflate content: %w", err)
 			}
