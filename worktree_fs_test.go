@@ -139,6 +139,31 @@ func TestWorktreeFilesystemAllowsValidPaths(t *testing.T) {
 	}
 }
 
+// TestWorktreeFilesystemMkdirAllRootIsNoop locks in the contract that
+// MkdirAll on a root-equivalent path is a silent no-op against the
+// wrapper. validPath itself still rejects "", ".", and "/" (see
+// TestValidPath), but MkdirAll specifically tolerates them because
+// "ensure the root exists" is always trivially satisfied.
+func TestWorktreeFilesystemMkdirAllRootIsNoop(t *testing.T) {
+	t.Parallel()
+
+	rootPaths := []string{"", ".", "/"}
+	for _, p := range rootPaths {
+		t.Run(p, func(t *testing.T) {
+			t.Parallel()
+
+			mfs := memfs.New()
+			fs := newWorktreeFilesystem(mfs, true, true)
+
+			require.NoError(t, fs.MkdirAll(p, 0o755))
+
+			entries, err := mfs.ReadDir("/")
+			require.NoError(t, err)
+			assert.Empty(t, entries, "MkdirAll(%q) must not materialise a directory entry", p)
+		})
+	}
+}
+
 func TestWorktreeFilesystemReturnsWorktreeFilesystem(t *testing.T) {
 	t.Parallel()
 
