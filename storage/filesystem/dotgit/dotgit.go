@@ -10,12 +10,14 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-billy/v6"
@@ -23,6 +25,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/plumbing/format/revfile"
 	plumbhash "github.com/go-git/go-git/v6/plumbing/hash"
 	"github.com/go-git/go-git/v6/storage"
@@ -123,7 +126,8 @@ type DotGit struct {
 	packList   []plumbing.Hash
 	packMap    map[plumbing.Hash]struct{}
 
-	files map[plumbing.Hash]billy.File
+	packHandlesMu sync.Mutex
+	packHandles   map[plumbing.Hash]*packhandle.PackHandle
 }
 
 // New returns a DotGit value ready to be used. The path argument must
@@ -173,26 +177,160 @@ func (d *DotGit) Initialize() error {
 	return nil
 }
 
-// Close closes all opened files.
+// Close closes all cached PackHandles. Idempotent.
 func (d *DotGit) Close() error {
-	var firstError error
-	if d.files != nil {
-		for _, f := range d.files {
-			err := f.Close()
-			if err != nil && firstError == nil {
-				firstError = err
-				continue
+	return d.ResetPackHandles()
+}
+
+// PackHandle returns the PackHandle for the given pack hash,
+// constructing and caching it on first call. Returns
+// ErrPackfileNotFound if the .pack file does not exist on disk.
+//
+// The PackHandle's Sources are constructed as follows:
+//
+//   - pack:  PathSource against the dotgit filesystem.
+//   - idx:   PathSource against the dotgit filesystem.
+//   - rev:   PathSource against the dotgit filesystem when
+//     ReadReverseIndex is true and the .rev file exists; otherwise
+//     a synthetic in-memory Source that generates the reverse
+//     index from the idx file on first need and caches the bytes
+//     for the PackHandle's lifetime.
+func (d *DotGit) PackHandle(hash plumbing.Hash) (*packhandle.PackHandle, error) {
+	if err := d.hasPack(hash); err != nil {
+		return nil, err
+	}
+
+	d.packHandlesMu.Lock()
+	defer d.packHandlesMu.Unlock()
+
+	if d.packHandles == nil {
+		d.packHandles = make(map[plumbing.Hash]*packhandle.PackHandle)
+	}
+	if ph, ok := d.packHandles[hash]; ok {
+		return ph, nil
+	}
+
+	// Verify the .pack file exists on disk before constructing a
+	// handle. Performed under packHandlesMu so a concurrent
+	// Reindex/DeleteOldObjectPackAndIndex either runs entirely
+	// before this lookup (we observe fresh state) or after (any
+	// entry we just cached is evicted on their pass). Skipped
+	// under ExclusiveAccess: hasPack already enforced existence
+	// via the cached packMap, so the Stat is wasted I/O.
+	if !d.options.ExclusiveAccess {
+		if _, err := d.fs.Stat(d.objectPackPath(hash, "pack")); err != nil {
+			if os.IsNotExist(err) {
+				return nil, ErrPackfileNotFound
 			}
+			return nil, err
 		}
-
-		d.files = nil
 	}
 
-	if firstError != nil {
-		return firstError
+	ph := packhandle.New(packhandle.Sources{
+		Pack: packhandle.PathSource(d.fs, d.objectPackPath(hash, "pack")),
+		Idx:  packhandle.PathSource(d.fs, d.objectPackPath(hash, "idx")),
+		Rev:  d.revSource(hash),
+	}, hash)
+	d.packHandles[hash] = ph
+	return ph, nil
+}
+
+// ResetPackHandles closes every cached PackHandle and clears the
+// cache. Called by ObjectStorage.Reindex when the on-disk pack
+// inventory has changed externally.
+func (d *DotGit) ResetPackHandles() error {
+	d.packHandlesMu.Lock()
+	defer d.packHandlesMu.Unlock()
+
+	var errs []error
+	for _, ph := range d.packHandles {
+		if err := ph.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	d.packHandles = nil
+	return errors.Join(errs...)
+}
+
+// revSource returns the rev Source for the given pack. When
+// ReadReverseIndex is true and the .rev file exists on disk, returns
+// PathSource. Otherwise returns a synthetic Source that generates the
+// reverse index from the idx file on first need and caches the bytes
+// for the PackHandle's lifetime.
+func (d *DotGit) revSource(hash plumbing.Hash) packhandle.Source {
+	if d.options.ReadReverseIndex {
+		revPath := d.objectPackPath(hash, "rev")
+		if _, err := d.fs.Stat(revPath); err == nil {
+			return packhandle.PathSource(d.fs, revPath)
+		}
+	}
+	return d.inMemoryRevSource(hash)
+}
+
+// inMemoryRevSource builds a Source whose Open returns a fresh
+// bytes-backed reader over rev bytes generated once per Source
+// (guarded by sync.Once).
+func (d *DotGit) inMemoryRevSource(hash plumbing.Hash) packhandle.Source {
+	var (
+		once     sync.Once
+		revBytes []byte
+		genErr   error
+	)
+	generate := func() ([]byte, error) {
+		once.Do(func() {
+			revBytes, genErr = d.generateInMemoryRevBytes(hash)
+		})
+		return revBytes, genErr
+	}
+	return packhandle.Source{
+		Open: func() (billy.File, error) {
+			b, err := generate()
+			if err != nil {
+				return nil, err
+			}
+			return newBytesReadAtCloser(b), nil
+		},
+		Size: func() (int64, error) {
+			b, err := generate()
+			if err != nil {
+				return 0, err
+			}
+			return int64(len(b)), nil
+		},
+	}
+}
+
+// generateInMemoryRevBytes generates the reverse index bytes from
+// the idx file. Extracted from generateInMemoryRev for reuse by
+// inMemoryRevSource.
+func (d *DotGit) generateInMemoryRevBytes(h plumbing.Hash) ([]byte, error) {
+	f, err := d.ObjectPackIdx(h)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	var hasher hash.Hash
+	if h.Size() == crypto.SHA256.Size() {
+		hasher = plumbhash.New(crypto.SHA256)
+	} else {
+		hasher = plumbhash.New(crypto.SHA1)
 	}
 
-	return nil
+	idx := idxfile.NewMemoryIndex(h.Size())
+	dec := idxfile.NewDecoder(f, hasher)
+	if err := dec.Decode(idx); err != nil {
+		return nil, fmt.Errorf("cannot decode idx for in-memory rev generation: %w", err)
+	}
+
+	hasher.Reset()
+
+	var buf bytes.Buffer
+	if err := revfile.Encode(&buf, hasher, idx); err != nil {
+		return nil, fmt.Errorf("cannot encode in-memory rev: %w", err)
+	}
+
+	return buf.Bytes(), nil
 }
 
 // ConfigWriter returns a file pointer for write to the config file
@@ -338,17 +476,6 @@ func (d *DotGit) objectPackPath(hash plumbing.Hash, extension string) string {
 }
 
 func (d *DotGit) objectPackOpen(hash plumbing.Hash, extension string) (billy.File, error) {
-	if d.options.KeepDescriptors && extension == "pack" {
-		if d.files == nil {
-			d.files = make(map[plumbing.Hash]billy.File)
-		}
-
-		f, ok := d.files[hash]
-		if ok {
-			return f, nil
-		}
-	}
-
 	err := d.hasPack(hash)
 	if err != nil {
 		return nil, err
@@ -362,10 +489,6 @@ func (d *DotGit) objectPackOpen(hash plumbing.Hash, extension string) (billy.Fil
 		}
 
 		return nil, err
-	}
-
-	if d.options.KeepDescriptors && extension == "pack" {
-		d.files[hash] = pack
 	}
 
 	return pack, nil
@@ -448,7 +571,12 @@ func (d *DotGit) generateInMemoryRev(h plumbing.Hash) (idxfile.ReadAtCloser, err
 	return newBytesReadAtCloser(buf.Bytes()), nil
 }
 
-// bytesReadAtCloser wraps a bytes.Reader to satisfy [idxfile.ReadAtCloser].
+// bytesReadAtCloser wraps a bytes.Reader to satisfy both
+// [idxfile.ReadAtCloser] and [billy.File]. The latter is needed by
+// the inMemoryRevSource path, which feeds the value into a
+// packhandle.Source whose Open returns billy.File. The write-side
+// methods (Write, WriteAt, Truncate) return os.ErrPermission since
+// the backing is a fixed byte slice.
 type bytesReadAtCloser struct {
 	*bytes.Reader
 }
@@ -457,9 +585,32 @@ func newBytesReadAtCloser(data []byte) *bytesReadAtCloser {
 	return &bytesReadAtCloser{Reader: bytes.NewReader(data)}
 }
 
-func (b *bytesReadAtCloser) Close() error { return nil }
+func (b *bytesReadAtCloser) Close() error                       { return nil }
+func (b *bytesReadAtCloser) Name() string                       { return "in-memory" }
+func (b *bytesReadAtCloser) Write([]byte) (int, error)          { return 0, os.ErrPermission }
+func (b *bytesReadAtCloser) WriteAt([]byte, int64) (int, error) { return 0, os.ErrPermission }
+func (b *bytesReadAtCloser) Truncate(int64) error               { return os.ErrPermission }
+func (b *bytesReadAtCloser) Stat() (fs.FileInfo, error) {
+	return bytesFileInfo{name: "in-memory", size: int64(b.Reader.Len())}, nil
+}
 
-// DeleteOldObjectPackAndIndex removes a pack and its index if older than t.
+// bytesFileInfo is the minimal fs.FileInfo for an in-memory
+// bytes-backed billy.File.
+type bytesFileInfo struct {
+	name string
+	size int64
+}
+
+func (i bytesFileInfo) Name() string       { return i.name }
+func (i bytesFileInfo) Size() int64        { return i.size }
+func (i bytesFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i bytesFileInfo) ModTime() time.Time { return time.Time{} }
+func (i bytesFileInfo) IsDir() bool        { return false }
+func (i bytesFileInfo) Sys() any           { return nil }
+
+// DeleteOldObjectPackAndIndex removes a pack and its index (and the
+// matching .rev file when present) if older than t, and evicts the
+// cached PackHandle for the hash.
 func (d *DotGit) DeleteOldObjectPackAndIndex(hash plumbing.Hash, t time.Time) error {
 	d.cleanPackList()
 
@@ -474,11 +625,30 @@ func (d *DotGit) DeleteOldObjectPackAndIndex(hash plumbing.Hash, t time.Time) er
 			return nil
 		}
 	}
-	err := d.fs.Remove(path)
-	if err != nil {
+	if err := d.fs.Remove(path); err != nil {
 		return err
 	}
-	return d.fs.Remove(d.objectPackPath(hash, `idx`))
+	if err := d.fs.Remove(d.objectPackPath(hash, `idx`)); err != nil {
+		return err
+	}
+	// Best-effort: not every pack has a .rev companion on disk.
+	if err := d.fs.Remove(d.objectPackPath(hash, `rev`)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	// Close and evict the cached PackHandle so subsequent PackHandle
+	// calls do not hand out a stale handle to files that no longer
+	// exist on disk. Close is idempotent; in-flight readers held by
+	// other goroutines complete normally.
+	d.packHandlesMu.Lock()
+	defer d.packHandlesMu.Unlock()
+	if ph, ok := d.packHandles[hash]; ok {
+		if err := ph.Close(); err != nil {
+			return err
+		}
+		delete(d.packHandles, hash)
+	}
+	return nil
 }
 
 // NewObject return a writer for a new object file.

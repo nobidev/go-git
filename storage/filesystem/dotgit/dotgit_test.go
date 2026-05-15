@@ -2,6 +2,7 @@ package dotgit
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
@@ -541,45 +543,6 @@ func (s *SuiteDotGit) TestObjectPack() {
 	pack, err := dir.ObjectPack(plumbing.NewHash(f.PackfileHash))
 	s.Require().NoError(err)
 	s.Equal(".pack", filepath.Ext(pack.Name()))
-}
-
-func (s *SuiteDotGit) TestObjectPackWithKeepDescriptors() {
-	f := fixtures.Basic().ByTag(".git").One()
-	fs, err := f.DotGit()
-	s.Require().NoError(err)
-	dir := NewWithOptions(fs, Options{KeepDescriptors: true})
-
-	pack, err := dir.ObjectPack(plumbing.NewHash(f.PackfileHash))
-	s.Require().NoError(err)
-	s.Equal(".pack", filepath.Ext(pack.Name()))
-
-	// Move to an specific offset
-	pack.Seek(42, io.SeekStart)
-
-	pack2, err := dir.ObjectPack(plumbing.NewHash(f.PackfileHash))
-	s.Require().NoError(err)
-
-	// If the file is the same the offset should be the same
-	offset, err := pack2.Seek(0, io.SeekCurrent)
-	s.Require().NoError(err)
-	s.Equal(int64(42), offset)
-
-	err = dir.Close()
-	s.Require().NoError(err)
-
-	pack2, err = dir.ObjectPack(plumbing.NewHash(f.PackfileHash))
-	s.Require().NoError(err)
-
-	// If the file is opened again its offset should be 0
-	offset, err = pack2.Seek(0, io.SeekCurrent)
-	s.Require().NoError(err)
-	s.Equal(int64(0), offset)
-
-	err = pack2.Close()
-	s.Require().NoError(err)
-
-	err = dir.Close()
-	s.NotNil(err)
 }
 
 func (s *SuiteDotGit) TestObjectPackIdx() {
@@ -1436,6 +1399,200 @@ func TestIssue55(t *testing.T) {
 			ro, err = isReadOnly(tc.fs, path)
 			require.NoError(t, err)
 			assert.True(t, ro, "file %q is not read-only", path)
+		})
+	}
+}
+
+func TestDotGit_PackHandleCached(t *testing.T) {
+	t.Parallel()
+	fixture := fixtures.Basic().One()
+	fsys, err := fixture.DotGit()
+	require.NoError(t, err)
+	dg := NewWithOptions(fsys, Options{ReadReverseIndex: true})
+	defer dg.Close()
+
+	packs, err := dg.ObjectPacks()
+	require.NoError(t, err)
+	require.NotEmpty(t, packs)
+	h := packs[0]
+
+	ph1, err := dg.PackHandle(h)
+	require.NoError(t, err)
+	ph2, err := dg.PackHandle(h)
+	require.NoError(t, err)
+	assert.Same(t, ph1, ph2)
+}
+
+func TestDotGit_ResetPackHandles(t *testing.T) {
+	t.Parallel()
+	fixture := fixtures.Basic().One()
+	fsys, err := fixture.DotGit()
+	require.NoError(t, err)
+	dg := NewWithOptions(fsys, Options{ReadReverseIndex: true})
+	defer dg.Close()
+
+	packs, err := dg.ObjectPacks()
+	require.NoError(t, err)
+	require.NotEmpty(t, packs)
+	h := packs[0]
+
+	ph1, err := dg.PackHandle(h)
+	require.NoError(t, err)
+
+	require.NoError(t, dg.ResetPackHandles())
+
+	ph2, err := dg.PackHandle(h)
+	require.NoError(t, err)
+	assert.NotSame(t, ph1, ph2)
+}
+
+func TestDotGit_PackHandleMissingPack(t *testing.T) {
+	t.Parallel()
+	fixture := fixtures.Basic().One()
+	fsys, err := fixture.DotGit()
+	require.NoError(t, err)
+	dg := NewWithOptions(fsys, Options{ReadReverseIndex: true})
+	defer dg.Close()
+
+	var missing plumbing.Hash
+	missing.ResetBySize(20)
+	_, err = missing.Write(bytes.Repeat([]byte{0xff}, 20))
+	require.NoError(t, err)
+
+	_, err = dg.PackHandle(missing)
+	assert.ErrorIs(t, err, ErrPackfileNotFound)
+}
+
+// TestDotGit_PackHandleInMemoryRev verifies the in-memory rev
+// fallback: when ReadReverseIndex=false (or .rev missing on disk),
+// the rev Source generates the data from the .idx on demand. We
+// drive this through ph.Index(), which constructs a LazyIndex that
+// reads the rev source during init — a successful Index build
+// confirms the in-memory rev source produced a valid RIDX payload.
+func TestDotGit_PackHandleInMemoryRev(t *testing.T) {
+	t.Parallel()
+	fixture := fixtures.Basic().One()
+	fsys, err := fixture.DotGit()
+	require.NoError(t, err)
+	dg := NewWithOptions(fsys, Options{ReadReverseIndex: false})
+	defer dg.Close()
+
+	packs, err := dg.ObjectPacks()
+	require.NoError(t, err)
+	require.NotEmpty(t, packs)
+	h := packs[0]
+
+	ph, err := dg.PackHandle(h)
+	require.NoError(t, err)
+
+	idx, err := ph.Index()
+	require.NoError(t, err, "Index build must succeed; covers rev source wiring")
+	require.NotNil(t, idx)
+}
+
+// TestDotGit_DeleteOldObjectPackAndIndexEvictsHandle verifies that
+// DeleteOldObjectPackAndIndex removes the .pack, .idx, and .rev files
+// from disk and closes-and-evicts the cached PackHandle. Without the
+// eviction the cache would still hand out a handle to files that no
+// longer exist on disk.
+func TestDotGit_DeleteOldObjectPackAndIndexEvictsHandle(t *testing.T) {
+	t.Parallel()
+
+	dg, h, fsys := createPackWithRev(t, Options{
+		ExclusiveAccess:   false,
+		ReadReverseIndex:  true,
+		WriteReverseIndex: true,
+	})
+	defer dg.Close()
+
+	// Sanity: .pack, .idx, and .rev all exist on disk.
+	packPath := fsys.Join("objects", "pack", "pack-"+h.String()+".pack")
+	idxPath := fsys.Join("objects", "pack", "pack-"+h.String()+".idx")
+	revPath := fsys.Join("objects", "pack", "pack-"+h.String()+".rev")
+	_, err := fsys.Stat(packPath)
+	require.NoError(t, err)
+	_, err = fsys.Stat(idxPath)
+	require.NoError(t, err)
+	_, err = fsys.Stat(revPath)
+	require.NoError(t, err)
+
+	// Prime the cache.
+	ph1, err := dg.PackHandle(h)
+	require.NoError(t, err)
+	require.NotNil(t, ph1)
+
+	// time.Time{} → IsZero → skip the mtime check.
+	require.NoError(t, dg.DeleteOldObjectPackAndIndex(h, time.Time{}))
+
+	// All three files should be gone from disk.
+	_, err = fsys.Stat(packPath)
+	assert.True(t, os.IsNotExist(err), "pack still on disk: %v", err)
+	_, err = fsys.Stat(idxPath)
+	assert.True(t, os.IsNotExist(err), "idx still on disk: %v", err)
+	_, err = fsys.Stat(revPath)
+	assert.True(t, os.IsNotExist(err), "rev still on disk: %v", err)
+
+	// The cache must no longer hand out a handle for this hash. The
+	// next PackHandle call hits the on-disk Stat and reports
+	// ErrPackfileNotFound.
+	_, err = dg.PackHandle(h)
+	assert.ErrorIs(t, err, ErrPackfileNotFound)
+
+	// The previously-held handle is still safe to inspect — the
+	// close-then-evict sequence must not corrupt in-flight references
+	// (Close is idempotent; metadata-only accessors do not panic).
+	assert.NotPanics(t, func() {
+		_ = ph1.Close()
+		_ = ph1.Close()
+	})
+}
+
+// BenchmarkPackHandleCacheHit measures the steady-state cost of a
+// cache-hit PackHandle lookup. With the Stat moved under
+// packHandlesMu and after the cache check, cache hits never pay a
+// Stat regardless of ExclusiveAccess; the remaining delta between
+// the two sub-benchmarks is the hasPack packMap lookup that
+// ExclusiveAccess=true performs on every call. The fixture is
+// materialised on an OS-backed filesystem so the Stat path (only
+// exercised on misses) reflects a real syscall rather than the
+// in-memory shortcut taken by memfs.
+func BenchmarkPackHandleCacheHit(b *testing.B) {
+	for _, exclusive := range []bool{false, true} {
+		name := "exclusive=false"
+		if exclusive {
+			name = "exclusive=true"
+		}
+		b.Run(name, func(b *testing.B) {
+			fixture := fixtures.Basic().One()
+			fsys, err := fixture.DotGit(fixtures.WithTargetDir(b.TempDir))
+			if err != nil {
+				b.Fatal(err)
+			}
+			dg := NewWithOptions(fsys, Options{
+				ExclusiveAccess:  exclusive,
+				ReadReverseIndex: true,
+			})
+			defer dg.Close()
+
+			packs, err := dg.ObjectPacks()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(packs) == 0 {
+				b.Fatal("no packs in fixture")
+			}
+			h := packs[0]
+			if _, err := dg.PackHandle(h); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := dg.PackHandle(h); err != nil {
+					b.Fatal(err)
+				}
+			}
 		})
 	}
 }
