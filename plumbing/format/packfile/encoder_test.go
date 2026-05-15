@@ -2,16 +2,30 @@ package packfile
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"testing"
 
+	billy "github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/storage/memory"
 )
+
+// nopSource returns a Source whose Open/Size always error. Used by
+// tests that build a PackHandle solely for the .pack file (idx is
+// provided via WithIdx, and the test path doesn't touch .rev).
+func nopSource(reason string) packhandle.Source {
+	err := func() error { return fmt.Errorf("packhandle source unavailable: %s", reason) }
+	return packhandle.Source{
+		Open: func() (billy.File, error) { return nil, err() },
+		Size: func() (int64, error) { return 0, err() },
+	}
+}
 
 type EncoderSuite struct {
 	suite.Suite
@@ -325,7 +339,13 @@ func packfileFromReader(s *EncoderSuite, buf *bytes.Buffer) (*Packfile, func()) 
 	_, err = file.Seek(0, io.SeekStart)
 	s.NoError(err)
 
-	return NewPackfile(file, WithIdx(index), WithFs(fs)), func() {
+	ph := packhandle.New(packhandle.Sources{
+		Pack: packhandle.PathSource(fs, "packfile"),
+		Idx:  nopSource("idx provided via WithIdx"),
+		Rev:  nopSource("rev not produced by this test"),
+	}, plumbing.ZeroHash)
+	return NewPackfile(ph, WithIdx(index)), func() {
 		s.NoError(file.Close())
+		s.NoError(ph.Close())
 	}
 }

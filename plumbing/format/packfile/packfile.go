@@ -1,18 +1,15 @@
 package packfile
 
 import (
-	"bufio"
 	"crypto"
 	"fmt"
-	"io"
 	"sync"
-
-	billy "github.com/go-git/go-billy/v6"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	format "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	gogitsync "github.com/go-git/go-git/v6/utils/sync"
@@ -28,14 +25,16 @@ var (
 )
 
 // Packfile allows retrieving information from inside a packfile.
+//
+// Packfile is metadata-only: it holds no file descriptors. Each
+// operation acquires a PackReader from the underlying PackHandle,
+// builds a Scanner over it, executes, and releases the reader on
+// return.
 type Packfile struct {
 	idxfile.Index
-	fs      billy.Filesystem
-	file    billy.File
-	scanner *Scanner
+	handle *packhandle.PackHandle
 
 	cache cache.Object
-	rbuf  *bufio.Reader
 
 	id           plumbing.Hash
 	m            sync.Mutex
@@ -45,16 +44,19 @@ type Packfile struct {
 	onceErr error
 }
 
-// NewPackfile returns a packfile representation for the given packfile file
-// and packfile idx.
-// If the filesystem is provided, the packfile will return FSObjects, otherwise
-// it will return MemoryObjects.
+// NewPackfile returns a Packfile representation backed by the given
+// PackHandle. The Packfile does not own the PackHandle; closing the
+// Packfile does NOT close the PackHandle.
+//
+// The Packfile is metadata-only: it holds no file descriptors.
+// Per-operation reader acquisition happens inside Get/GetByOffset/
+// GetByType.
 func NewPackfile(
-	file billy.File,
+	handle *packhandle.PackHandle,
 	opts ...PackfileOption,
 ) *Packfile {
 	p := &Packfile{
-		file:         file,
+		handle:       handle,
 		objectIDSize: crypto.SHA1.Size(),
 	}
 	for _, opt := range opts {
@@ -72,7 +74,21 @@ func (p *Packfile) Get(h plumbing.Hash) (plumbing.EncodedObject, error) {
 	p.m.Lock()
 	defer p.m.Unlock()
 
-	return p.get(h)
+	// Cache-hit fast path: skip Scanner construction entirely.
+	if obj, ok := p.cache.Get(h); ok {
+		return obj, nil
+	}
+
+	var result plumbing.EncodedObject
+	err := p.withScanner(func(s *Scanner) error {
+		obj, err := p.getWith(s, h)
+		if err != nil {
+			return err
+		}
+		result = obj
+		return nil
+	})
+	return result, err
 }
 
 // GetByOffset retrieves the encoded object from the packfile at the given
@@ -84,12 +100,28 @@ func (p *Packfile) GetByOffset(offset int64) (plumbing.EncodedObject, error) {
 	p.m.Lock()
 	defer p.m.Unlock()
 
-	return p.getByOffset(offset)
+	// Cache-hit fast path: skip Scanner construction entirely.
+	if h, err := p.FindHash(offset); err == nil {
+		if obj, ok := p.cache.Get(h); ok {
+			return obj, nil
+		}
+	}
+
+	var result plumbing.EncodedObject
+	err := p.withScanner(func(s *Scanner) error {
+		obj, err := p.getByOffsetWith(s, offset)
+		if err != nil {
+			return err
+		}
+		result = obj
+		return nil
+	})
+	return result, err
 }
 
 // GetSizeByOffset retrieves the size of the encoded object from the
 // packfile with the given offset.
-func (p *Packfile) GetSizeByOffset(offset int64) (size int64, err error) {
+func (p *Packfile) GetSizeByOffset(offset int64) (int64, error) {
 	if err := p.init(); err != nil {
 		return 0, err
 	}
@@ -121,32 +153,99 @@ func (p *Packfile) GetByType(typ plumbing.ObjectType) (storer.EncodedObjectIter,
 		plumbing.TreeObject,
 		plumbing.CommitObject,
 		plumbing.TagObject:
+		// withScanner won't work because the iterator outlives this
+		// function. Acquire reader + scanner inline; iterator's Close
+		// releases them.
+		pr, err := p.handle.OpenPackReader()
+		if err != nil {
+			return nil, err
+		}
+		rbuf := gogitsync.GetBufioReader(nil)
+		sopts := []ScannerOption{WithBufioReader(rbuf)}
+		if p.objectIDSize == format.SHA256Size {
+			sopts = append(sopts, WithSHA256())
+		}
+		scanner := NewScanner(pr, sopts...)
+		if !scanner.Scan() {
+			gogitsync.PutBufioReader(rbuf)
+			_ = pr.Close()
+			return nil, scanner.Error()
+		}
+
 		entries, err := p.EntriesByOffset()
 		if err != nil {
+			gogitsync.PutBufioReader(rbuf)
+			_ = pr.Close()
 			return nil, err
 		}
 
 		return &objectIter{
-			p:    p,
-			iter: entries,
-			typ:  typ,
+			p:       p,
+			iter:    entries,
+			typ:     typ,
+			scanner: scanner,
+			reader:  pr,
+			rbuf:    rbuf,
 		}, nil
 	default:
 		return nil, plumbing.ErrInvalidType
 	}
 }
 
-// Scanner returns the Packfile's inner scanner.
-//
-// Deprecated: this will be removed in future versions of the packfile package
-// to avoid exposing the package internals and to improve its thread-safety.
-// TODO: Remove Scanner method
-func (p *Packfile) Scanner() (*Scanner, error) {
+// DeltaObject returns the delta-flavored EncodedObject for the given
+// hash + offset. If the header at offset is not a delta type, the
+// fully-decoded object at that offset is returned via getByOffsetWith.
+// This subsumes the logic previously exposed via Scanner() to
+// ObjectStorage.decodeDeltaObjectAt.
+func (p *Packfile) DeltaObject(hash plumbing.Hash, offset int64) (plumbing.EncodedObject, error) {
 	if err := p.init(); err != nil {
 		return nil, err
 	}
+	p.m.Lock()
+	defer p.m.Unlock()
 
-	return p.scanner, nil
+	var result plumbing.EncodedObject
+	err := p.withScanner(func(s *Scanner) error {
+		if err := s.SeekFromStart(offset); err != nil {
+			return err
+		}
+		if !s.Scan() {
+			return fmt.Errorf("failed to decode delta object")
+		}
+		header := s.Data().Value().(ObjectHeader)
+
+		var base plumbing.Hash
+		switch header.Type {
+		case plumbing.REFDeltaObject:
+			base = header.Reference
+		case plumbing.OFSDeltaObject:
+			var err error
+			base, err = p.FindHash(header.OffsetReference)
+			if err != nil {
+				return err
+			}
+		default:
+			obj, err := p.getByOffsetWith(s, offset)
+			if err != nil {
+				return err
+			}
+			result = obj
+			return nil
+		}
+
+		obj := &plumbing.MemoryObject{}
+		obj.SetType(header.Type)
+		w, err := obj.Writer()
+		if err != nil {
+			return err
+		}
+		if err := s.WriteObject(&header, w); err != nil {
+			return err
+		}
+		result = newDeltaObject(obj, hash, base, header.Size)
+		return nil
+	})
+	return result, err
 }
 
 // ID returns the ID of the packfile, which is the checksum at the end of it.
@@ -158,8 +257,34 @@ func (p *Packfile) ID() (plumbing.Hash, error) {
 	return p.id, nil
 }
 
-// get is not threat-safe, and should only be called within packfile.go.
-func (p *Packfile) get(h plumbing.Hash) (plumbing.EncodedObject, error) {
+// withScanner acquires a fresh PackReader from the handle, builds a
+// Scanner over it, calls fn, and releases the reader on return. The
+// caller owns Packfile's external mutex (p.m).
+func (p *Packfile) withScanner(fn func(*Scanner) error) error {
+	pr, err := p.handle.OpenPackReader()
+	if err != nil {
+		return err
+	}
+	defer pr.Close()
+
+	rbuf := gogitsync.GetBufioReader(nil)
+	defer gogitsync.PutBufioReader(rbuf)
+
+	sopts := []ScannerOption{WithBufioReader(rbuf)}
+	if p.objectIDSize == format.SHA256Size {
+		sopts = append(sopts, WithSHA256())
+	}
+
+	scanner := NewScanner(pr, sopts...)
+	if !scanner.Scan() {
+		return scanner.Error()
+	}
+	return fn(scanner)
+}
+
+// getWith decodes the object identified by h using the supplied
+// Scanner. Caller holds p.m.
+func (p *Packfile) getWith(s *Scanner, h plumbing.Hash) (plumbing.EncodedObject, error) {
 	if obj, ok := p.cache.Get(h); ok {
 		return obj, nil
 	}
@@ -169,16 +294,17 @@ func (p *Packfile) get(h plumbing.Hash) (plumbing.EncodedObject, error) {
 		return nil, err
 	}
 
-	oh, err := p.headerFromOffset(offset)
+	oh, err := p.headerFromOffsetWith(s, offset)
 	if err != nil {
 		return nil, err
 	}
 
-	return p.objectFromHeader(oh)
+	return p.objectFromHeaderWith(s, oh)
 }
 
-// getByOffset is not threat-safe, and should only be called within packfile.go.
-func (p *Packfile) getByOffset(offset int64) (plumbing.EncodedObject, error) {
+// getByOffsetWith decodes the object at the given offset using the
+// supplied Scanner. Caller holds p.m.
+func (p *Packfile) getByOffsetWith(s *Scanner, offset int64) (plumbing.EncodedObject, error) {
 	h, err := p.FindHash(offset)
 	if err != nil {
 		return nil, err
@@ -188,18 +314,18 @@ func (p *Packfile) getByOffset(offset int64) (plumbing.EncodedObject, error) {
 		return obj, nil
 	}
 
-	oh, err := p.headerFromOffset(offset)
+	oh, err := p.headerFromOffsetWith(s, offset)
 	if err != nil {
 		return nil, err
 	}
 
-	return p.objectFromHeader(oh)
+	return p.objectFromHeaderWith(s, oh)
 }
 
 func (p *Packfile) init() error {
 	p.once.Do(func() {
-		if p.file == nil {
-			p.onceErr = fmt.Errorf("file is not set")
+		if p.handle == nil {
+			p.onceErr = fmt.Errorf("pack handle is not set")
 			return
 		}
 
@@ -208,32 +334,12 @@ func (p *Packfile) init() error {
 			return
 		}
 
-		p.rbuf = gogitsync.GetBufioReader(nil)
-
-		opts := []ScannerOption{WithBufioReader(p.rbuf)}
-
-		if p.objectIDSize == format.SHA256Size {
-			opts = append(opts, WithSHA256())
-		}
-
-		p.scanner = NewScanner(p.file, opts...)
-		// Validate packfile signature.
-		if !p.scanner.Scan() {
-			p.onceErr = p.scanner.Error()
-			return
-		}
-
-		_, err := p.scanner.Seek(-int64(p.objectIDSize), io.SeekEnd)
+		meta, err := p.handle.Meta()
 		if err != nil {
 			p.onceErr = err
 			return
 		}
-
-		p.id.ResetBySize(p.objectIDSize)
-		_, err = p.id.ReadFrom(p.scanner)
-		if err != nil {
-			p.onceErr = err
-		}
+		p.id = meta.ID
 
 		if p.cache == nil {
 			p.cache = cache.NewObjectLRUDefault()
@@ -243,52 +349,50 @@ func (p *Packfile) init() error {
 	return p.onceErr
 }
 
-func (p *Packfile) headerFromOffset(offset int64) (*ObjectHeader, error) {
-	err := p.scanner.SeekFromStart(offset)
+func (p *Packfile) headerFromOffsetWith(s *Scanner, offset int64) (*ObjectHeader, error) {
+	err := s.SeekFromStart(offset)
 	if err != nil {
 		return nil, err
 	}
 
-	if !p.scanner.Scan() {
+	if !s.Scan() {
 		return nil, plumbing.ErrObjectNotFound
 	}
 
-	oh := p.scanner.Data().Value().(ObjectHeader)
+	oh := s.Data().Value().(ObjectHeader)
 	return &oh, nil
 }
 
-// Close the packfile and its resources.
+// Close is a no-op preserved for API compatibility. The Packfile
+// holds no FDs; PackHandle owns FD lifecycle.
 func (p *Packfile) Close() error {
-	p.m.Lock()
-	defer p.m.Unlock()
-
-	gogitsync.PutBufioReader(p.rbuf)
-
-	closer, ok := p.file.(io.Closer)
-	if !ok {
-		return nil
-	}
-
-	return closer.Close()
+	return nil
 }
 
-func (p *Packfile) objectFromHeader(oh *ObjectHeader) (plumbing.EncodedObject, error) {
+// objectAtScannerWith decodes one object at the given offset using
+// the iterator-held scanner. Caller holds p.m.
+func (p *Packfile) objectAtScannerWith(s *Scanner, offset int64) (plumbing.EncodedObject, error) {
+	oh, err := p.headerFromOffsetWith(s, offset)
+	if err != nil {
+		return nil, err
+	}
+	return p.objectFromHeaderWith(s, oh)
+}
+
+func (p *Packfile) objectFromHeaderWith(s *Scanner, oh *ObjectHeader) (plumbing.EncodedObject, error) {
 	if oh == nil {
 		return nil, plumbing.ErrObjectNotFound
 	}
 
-	// If we have filesystem, and the object is not a delta type, return a FSObject.
-	// This avoids having to inflate the object more than once.
-	if !oh.Type.IsDelta() && p.fs != nil {
+	// FSObject path: non-delta object, PackHandle available.
+	if !oh.Type.IsDelta() && p.handle != nil {
 		fs := NewFSObject(
 			oh.ID(),
 			oh.Type,
 			oh.ContentOffset,
 			oh.Size,
 			p.Index,
-			p.fs,
-			p.file,
-			p.file.Name(),
+			p.handle,
 			p.cache,
 		)
 
@@ -296,10 +400,10 @@ func (p *Packfile) objectFromHeader(oh *ObjectHeader) (plumbing.EncodedObject, e
 		return fs, nil
 	}
 
-	return p.getMemoryObject(oh)
+	return p.getMemoryObjectWith(s, oh)
 }
 
-func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, error) {
+func (p *Packfile) getMemoryObjectWith(s *Scanner, oh *ObjectHeader) (plumbing.EncodedObject, error) {
 	of := format.SHA1
 	if p.objectIDSize == format.SHA256.Size() {
 		of = format.SHA256
@@ -318,7 +422,7 @@ func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, er
 
 	switch oh.Type {
 	case plumbing.CommitObject, plumbing.TreeObject, plumbing.BlobObject, plumbing.TagObject:
-		err = p.scanner.inflateContent(oh.ContentOffset, w, oh.Size)
+		err = s.inflateContent(oh.ContentOffset, w, oh.Size)
 
 	case plumbing.REFDeltaObject, plumbing.OFSDeltaObject:
 		var parent plumbing.EncodedObject
@@ -328,10 +432,10 @@ func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, er
 			var ok bool
 			parent, ok = p.cache.Get(oh.Reference)
 			if !ok {
-				parent, err = p.get(oh.Reference)
+				parent, err = p.getWith(s, oh.Reference)
 			}
 		case plumbing.OFSDeltaObject:
-			parent, err = p.getByOffset(oh.OffsetReference)
+			parent, err = p.getByOffsetWith(s, oh.OffsetReference)
 		}
 
 		if err != nil {
@@ -344,7 +448,7 @@ func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, er
 		// duplicate copy of the delta payload.
 		if oh.content == nil {
 			oh.content = gogitsync.GetBytesBuffer()
-			err = p.scanner.inflateContent(oh.ContentOffset, oh.content, oh.Size)
+			err = s.inflateContent(oh.ContentOffset, oh.content, oh.Size)
 			if err != nil {
 				return nil, fmt.Errorf("cannot inflate content: %w", err)
 			}

@@ -2,100 +2,80 @@ package packfile
 
 import (
 	"bufio"
-	"errors"
 	"io"
-	"os"
-
-	billy "github.com/go-git/go-billy/v6"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	"github.com/go-git/go-git/v6/utils/sync"
 )
 
-// FSObject is an object from the packfile on the filesystem.
+// FSObject is an object from the packfile, backed by a PackHandle.
 type FSObject struct {
-	hash     plumbing.Hash
-	offset   int64
-	size     int64
-	typ      plumbing.ObjectType
-	index    idxfile.Index
-	fs       billy.Filesystem
-	pack     billy.File
-	packPath string
-	cache    cache.Object
+	hash   plumbing.Hash
+	offset int64
+	size   int64
+	typ    plumbing.ObjectType
+	index  idxfile.Index
+	handle *packhandle.PackHandle
+	cache  cache.Object
 }
 
-// NewFSObject creates a new filesystem object.
+// NewFSObject creates a new filesystem object backed by a PackHandle.
+// The handle owns the FD lifecycle: Reader() acquires a fresh
+// PackReader per call and releases it on the returned ReadCloser's
+// Close.
 func NewFSObject(
 	hash plumbing.Hash,
 	finalType plumbing.ObjectType,
 	offset int64,
 	contentSize int64,
 	index idxfile.Index,
-	fs billy.Filesystem,
-	pack billy.File,
-	packPath string,
+	handle *packhandle.PackHandle,
 	cache cache.Object,
 ) *FSObject {
 	return &FSObject{
-		hash:     hash,
-		offset:   offset,
-		size:     contentSize,
-		typ:      finalType,
-		index:    index,
-		fs:       fs,
-		pack:     pack,
-		packPath: packPath,
-		cache:    cache,
+		hash:   hash,
+		offset: offset,
+		size:   contentSize,
+		typ:    finalType,
+		index:  index,
+		handle: handle,
+		cache:  cache,
 	}
 }
 
 // Reader implements the plumbing.EncodedObject interface.
 func (o *FSObject) Reader() (io.ReadCloser, error) {
-	obj, ok := o.cache.Get(o.hash)
-	if ok && obj != o {
-		reader, err := obj.Reader()
-		if err != nil {
-			return nil, err
-		}
-
-		return reader, nil
+	if obj, ok := o.cache.Get(o.hash); ok && obj != o {
+		return obj.Reader()
 	}
 
-	var file io.Closer
-	_, err := o.pack.Seek(o.offset, io.SeekStart)
-	// fsobject aims to reuse an existing file descriptor to the packfile.
-	// In some cases that descriptor would already be closed, in such cases,
-	// open the packfile again and close it when the reader is closed.
-	if err != nil && errors.Is(err, os.ErrClosed) {
-		o.pack, err = o.fs.Open(o.packPath)
-		if err != nil {
-			return nil, err
-		}
-		file = o.pack
-		_, err = o.pack.Seek(o.offset, io.SeekStart)
-	}
+	pr, err := o.handle.OpenPackReader()
 	if err != nil {
-		if file != nil {
-			_ = file.Close()
-		}
 		return nil, err
 	}
 
-	br := sync.GetBufioReader(o.pack)
+	if _, err := pr.Seek(o.offset, io.SeekStart); err != nil {
+		_ = pr.Close()
+		return nil, err
+	}
 
+	br := sync.GetBufioReader(pr)
 	zr, err := sync.GetZlibReader(br)
 	if err != nil {
 		sync.PutBufioReader(br)
-		if file != nil {
-			_ = file.Close()
-		}
+		_ = pr.Close()
 		return nil, err
 	}
-	return NewBoundedReadCloser(&zlibReadCloser{r: zr, f: file, rbuf: br}, o.size), nil
+
+	return NewBoundedReadCloser(&zlibReadCloser{
+		r:    zr,
+		f:    pr, // packhandle.PackReader is io.Closer; close releases the refcount
+		rbuf: br,
+	}, o.size), nil
 }
 
 type zlibReadCloser struct {

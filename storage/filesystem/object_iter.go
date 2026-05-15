@@ -2,14 +2,16 @@ package filesystem
 
 import (
 	"crypto"
+	"fmt"
 	"io"
 
-	"github.com/go-git/go-billy/v6"
+	billy "github.com/go-git/go-billy/v6"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/plumbing/hash"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 )
@@ -115,8 +117,14 @@ func newPackfileIter(
 	keepPack bool,
 	objectIDSize int,
 ) (storer.EncodedObjectIter, error) {
-	p := packfile.NewPackfile(f,
-		packfile.WithFs(fs),
+	// Transitional: build a PackHandle over the pack file via
+	// PathSource so FSObjects cached during iteration can re-open
+	// the pack file independently of the caller's lifecycle. The
+	// caller-owned `f` continues to be closed by packfileIter.Close.
+	// T10 replaces this with the dotgit PackHandle cache.
+	ph := transitionalIterPackHandle(fs, f.Name())
+
+	p := packfile.NewPackfile(ph,
 		packfile.WithCache(cache),
 		packfile.WithIdx(index),
 		packfile.WithObjectIDSize(objectIDSize),
@@ -136,6 +144,27 @@ func newPackfileIter(
 		seen:     seen,
 		keepPack: keepPack,
 	}, nil
+}
+
+// transitionalIterPackHandle builds a PackHandle over the pack file
+// at fs/packPath using PathSource. Idx and Rev Sources are stubs —
+// callers must provide the index via WithIdx and must not exercise
+// the .rev path. Removed in T10.
+func transitionalIterPackHandle(fs billy.Filesystem, packPath string) *packhandle.PackHandle {
+	errSrc := func(name string) packhandle.Source {
+		err := func() error {
+			return fmt.Errorf("packhandle: transitional iter handle has no %s source", name)
+		}
+		return packhandle.Source{
+			Open: func() (billy.File, error) { return nil, err() },
+			Size: func() (int64, error) { return 0, err() },
+		}
+	}
+	return packhandle.New(packhandle.Sources{
+		Pack: packhandle.PathSource(fs, packPath),
+		Idx:  errSrc("idx"),
+		Rev:  errSrc("rev"),
+	}, plumbing.ZeroHash)
 }
 
 func (iter *packfileIter) Next() (plumbing.EncodedObject, error) {

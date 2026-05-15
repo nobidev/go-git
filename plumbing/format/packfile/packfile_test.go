@@ -2,11 +2,11 @@ package packfile_test
 
 import (
 	"crypto"
+	"fmt"
 	"io"
 	"math"
 	"testing"
 
-	"github.com/go-git/go-billy/v6/osfs"
 	fixtures "github.com/go-git/go-git-fixtures/v6"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,6 +17,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/plumbing/hash"
 )
 
@@ -276,18 +277,32 @@ func newPackfile(t testing.TB, f *fixtures.Fixture) *packfile.Packfile {
 	t.Helper()
 
 	index := getIndexFromFixture(t, f)
-	pf, err := f.Packfile()
-	require.NoError(t, err)
+	ph := packHandleFromFixture(t, f)
 
 	opts := []packfile.PackfileOption{
 		packfile.WithIdx(index),
-		packfile.WithFs(osfs.New(t.TempDir())),
 	}
 	if f.ObjectFormat == "sha256" {
 		opts = append(opts, packfile.WithObjectIDSize(config.SHA256.Size()))
 	}
 
-	return packfile.NewPackfile(pf, opts...)
+	return packfile.NewPackfile(ph, opts...)
+}
+
+// packHandleFromFixture builds a PackHandle whose three Sources read
+// the .pack/.idx/.rev files from the fixtures embed.FS directly.
+func packHandleFromFixture(t testing.TB, f *fixtures.Fixture) *packhandle.PackHandle {
+	t.Helper()
+	stem := fmt.Sprintf("data/pack-%s", f.PackfileHash)
+	packHash, ok := plumbing.FromHex(f.PackfileHash)
+	require.True(t, ok, "fixture packfile hash unparseable: %q", f.PackfileHash)
+	ph := packhandle.New(packhandle.Sources{
+		Pack: packhandle.PathSource(fixtures.Filesystem, stem+".pack"),
+		Idx:  packhandle.PathSource(fixtures.Filesystem, stem+".idx"),
+		Rev:  packhandle.PathSource(fixtures.Filesystem, stem+".rev"),
+	}, packHash)
+	t.Cleanup(func() { _ = ph.Close() })
+	return ph
 }
 
 func BenchmarkGetByOffset(b *testing.B) {
@@ -304,26 +319,19 @@ func BenchmarkGetByOffset(b *testing.B) {
 
 		b.Run(format+"/with_storage",
 			func() func(b *testing.B) {
-				pf1, err := f.Packfile()
-				if err != nil {
-					b.Fatal(err)
-				}
+				ph := packHandleFromFixture(b, f)
 				opts := []packfile.PackfileOption{
 					packfile.WithIdx(idx),
-					packfile.WithFs(osfs.New(b.TempDir())),
 					packfile.WithCache(c),
 				}
 				if f.ObjectFormat == "sha256" {
 					opts = append(opts, packfile.WithObjectIDSize(config.SHA256.Size()))
 				}
-				return benchmarkGetByOffset(entries, packfile.NewPackfile(pf1, opts...))
+				return benchmarkGetByOffset(entries, packfile.NewPackfile(ph, opts...))
 			}())
 		b.Run(format+"/without_storage",
 			func() func(b *testing.B) {
-				pf2, err := f.Packfile()
-				if err != nil {
-					b.Fatal(err)
-				}
+				ph := packHandleFromFixture(b, f)
 				opts := []packfile.PackfileOption{
 					packfile.WithCache(c),
 					packfile.WithIdx(idx),
@@ -331,13 +339,80 @@ func BenchmarkGetByOffset(b *testing.B) {
 				if f.ObjectFormat == "sha256" {
 					opts = append(opts, packfile.WithObjectIDSize(config.SHA256.Size()))
 				}
-				return benchmarkGetByOffset(entries, packfile.NewPackfile(pf2, opts...))
+				return benchmarkGetByOffset(entries, packfile.NewPackfile(ph, opts...))
 			}())
 	}
 }
 
 func benchmarkGetByOffset(entries map[plumbing.Hash]int64, p *packfile.Packfile) func(b *testing.B) {
 	return func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for h, o := range entries {
+				obj, err := p.GetByOffset(o)
+				if err != nil {
+					b.Fatal()
+				}
+				if h != obj.Hash() {
+					b.Fatal()
+				}
+			}
+		}
+	}
+}
+
+// BenchmarkGetByOffset_CacheHit isolates the cache-hit cost from the
+// cache-miss cost by warming the cache with one full pass over all
+// entries before resetting the timer. Subsequent passes hit the cache
+// for every offset, locking in the Scanner-bypass fast path in
+// GetByOffset.
+func BenchmarkGetByOffset_CacheHit(b *testing.B) {
+	for _, format := range []string{"sha1", "sha256"} {
+		packs := fixtures.ByTag("packfile-entries").ByObjectFormat(format)
+		if len(packs) == 0 {
+			continue
+		}
+		f := packs.One()
+
+		idx := getIndexFromFixture(b, f)
+		entries := fixtureutil.Entries(f)
+
+		b.Run(format+"/with_storage",
+			func() func(b *testing.B) {
+				ph := packHandleFromFixture(b, f)
+				opts := []packfile.PackfileOption{
+					packfile.WithIdx(idx),
+					packfile.WithCache(cache.NewObjectLRUDefault()),
+				}
+				if f.ObjectFormat == "sha256" {
+					opts = append(opts, packfile.WithObjectIDSize(config.SHA256.Size()))
+				}
+				return benchmarkGetByOffsetCacheHit(b, entries, packfile.NewPackfile(ph, opts...))
+			}())
+		b.Run(format+"/without_storage",
+			func() func(b *testing.B) {
+				ph := packHandleFromFixture(b, f)
+				opts := []packfile.PackfileOption{
+					packfile.WithIdx(idx),
+					packfile.WithCache(cache.NewObjectLRUDefault()),
+				}
+				if f.ObjectFormat == "sha256" {
+					opts = append(opts, packfile.WithObjectIDSize(config.SHA256.Size()))
+				}
+				return benchmarkGetByOffsetCacheHit(b, entries, packfile.NewPackfile(ph, opts...))
+			}())
+	}
+}
+
+func benchmarkGetByOffsetCacheHit(b *testing.B, entries map[plumbing.Hash]int64, p *packfile.Packfile) func(b *testing.B) {
+	b.Helper()
+	// Warm the cache with one full pass; excluded from the timed region.
+	for _, o := range entries {
+		if _, err := p.GetByOffset(o); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return func(b *testing.B) {
+		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			for h, o := range entries {
 				obj, err := p.GetByOffset(o)

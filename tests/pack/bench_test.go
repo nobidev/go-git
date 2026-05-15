@@ -8,8 +8,6 @@ import (
 	"testing"
 
 	"github.com/go-git/go-billy/v6"
-	"github.com/go-git/go-billy/v6/memfs"
-	"github.com/go-git/go-billy/v6/osfs"
 	fixtures "github.com/go-git/go-git-fixtures/v6"
 	"github.com/stretchr/testify/require"
 
@@ -92,14 +90,12 @@ func BenchmarkPackHandlers(b *testing.B) {
 		})
 
 		runBenchmark(b, "packfile-cache-osfs: "+data.name, func() packHandler[int64] {
-			return newPackfileOpts(pack, idx,
-				packfile.WithFs(osfs.New(b.TempDir())),
+			return newPackfileOpts(pack, idx, rev,
 				packfile.WithCache(cache.NewObjectLRUDefault()))
 		}, data.offsetHashMap)
 
 		runBenchmark(b, "packfile-nocache-memfs:"+data.name, func() packHandler[int64] {
-			return newPackfileOpts(pack, idx,
-				packfile.WithFs(memfs.New()))
+			return newPackfileOpts(pack, idx, rev)
 		}, data.offsetHashMap)
 
 		if runtime.GOOS != "windows" {

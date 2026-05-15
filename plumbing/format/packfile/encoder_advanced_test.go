@@ -2,10 +2,12 @@ package packfile_test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"math/rand"
 	"testing"
 
+	billy "github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	fixtures "github.com/go-git/go-git-fixtures/v6"
 	"github.com/stretchr/testify/suite"
@@ -16,9 +18,20 @@ import (
 	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
 	. "github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 )
+
+// stubSource returns a Source whose Open/Size always error. Used by
+// tests that build a PackHandle solely for the .pack file path.
+func stubSource(reason string) packhandle.Source {
+	err := func() error { return fmt.Errorf("packhandle source unavailable: %s", reason) }
+	return packhandle.Source{
+		Open: func() (billy.File, error) { return nil, err() },
+		Size: func() (int64, error) { return 0, err() },
+	}
+}
 
 type EncoderAdvancedSuite struct {
 	suite.Suite
@@ -126,7 +139,13 @@ func (s *EncoderAdvancedSuite) testEncodeDecode(
 	_, err = f.Seek(0, io.SeekStart)
 	s.NoError(err)
 
-	p := NewPackfile(f, WithIdx(index), WithFs(fs), WithObjectIDSize(objectFormat.Size()))
+	ph := packhandle.New(packhandle.Sources{
+		Pack: packhandle.PathSource(fs, "packfile"),
+		Idx:  stubSource("idx provided via WithIdx"),
+		Rev:  stubSource("rev not produced by this test"),
+	}, encodeHash)
+	defer ph.Close()
+	p := NewPackfile(ph, WithIdx(index), WithObjectIDSize(objectFormat.Size()))
 
 	decodeHash, err := p.ID()
 	s.NoError(err)

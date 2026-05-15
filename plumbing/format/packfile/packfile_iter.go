@@ -1,90 +1,74 @@
 package packfile
 
 import (
+	"bufio"
+	"errors"
 	"io"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
+	gogitsync "github.com/go-git/go-git/v6/utils/sync"
 )
 
+// objectIter iterates objects in a packfile in offset order. It owns
+// the PackReader + Scanner acquired in Packfile.GetByType, releasing
+// both on Close.
 type objectIter struct {
-	p    *Packfile
-	typ  plumbing.ObjectType
-	iter idxfile.EntryIter
+	p       *Packfile
+	iter    idxfile.EntryIter
+	typ     plumbing.ObjectType
+	scanner *Scanner
+	reader  packhandle.PackReader
+	rbuf    *bufio.Reader
 }
 
-func (i *objectIter) Next() (plumbing.EncodedObject, error) {
-	if err := i.p.init(); err != nil {
-		return nil, err
-	}
-
-	i.p.m.Lock()
-	defer i.p.m.Unlock()
-
-	return i.next()
-}
-
-func (i *objectIter) next() (plumbing.EncodedObject, error) {
+func (iter *objectIter) Next() (plumbing.EncodedObject, error) {
 	for {
-		e, err := i.iter.Next()
+		entry, err := iter.iter.Next()
 		if err != nil {
 			return nil, err
 		}
 
-		oh, err := i.p.headerFromOffset(int64(e.Offset))
+		iter.p.m.Lock()
+		obj, err := iter.p.objectAtScannerWith(iter.scanner, int64(entry.Offset))
+		iter.p.m.Unlock()
 		if err != nil {
 			return nil, err
 		}
 
-		if i.typ == plumbing.AnyObject {
-			return i.p.objectFromHeader(oh)
+		if iter.typ == plumbing.AnyObject || obj.Type() == iter.typ {
+			return obj, nil
 		}
-
-		// Current object header type is a delta, get the actual object to
-		// assess the actual type.
-		if oh.Type.IsDelta() {
-			o, err := i.p.objectFromHeader(oh)
-			if o.Type() == i.typ {
-				return o, err
-			}
-
-			continue
-		}
-
-		if oh.Type == i.typ {
-			return i.p.objectFromHeader(oh)
-		}
-
-		continue
+		// Object doesn't match type filter; continue.
 	}
 }
 
-func (i *objectIter) ForEach(f func(plumbing.EncodedObject) error) error {
-	if err := i.p.init(); err != nil {
-		return err
-	}
-
-	i.p.m.Lock()
-	defer i.p.m.Unlock()
-
+func (iter *objectIter) ForEach(cb func(plumbing.EncodedObject) error) error {
+	defer iter.Close()
 	for {
-		o, err := i.next()
+		obj, err := iter.Next()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
 		}
-
-		if err := f(o); err != nil {
+		if err := cb(obj); err != nil {
 			return err
 		}
 	}
 }
 
-func (i *objectIter) Close() {
-	i.p.m.Lock()
-	defer i.p.m.Unlock()
-
-	_ = i.iter.Close()
+func (iter *objectIter) Close() {
+	iter.iter.Close()
+	iter.scanner = nil
+	if iter.reader != nil {
+		_ = iter.reader.Close()
+		iter.reader = nil
+	}
+	if iter.rbuf != nil {
+		gogitsync.PutBufioReader(iter.rbuf)
+		iter.rbuf = nil
+	}
 }

@@ -4,7 +4,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/go-git/go-billy/v6/osfs"
 	fixtures "github.com/go-git/go-git-fixtures/v6"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,17 +24,8 @@ func TestPackfileEmbedFS(t *testing.T) {
 	fixture := fixtures.Basic().One()
 	suite.Run(t, &PackHandlerSuite[int64]{
 		newPackHandler: func() packHandler[int64] {
-			pack, err := fixture.Packfile()
-			require.NoError(t, err)
-			idx, err := fixture.Idx()
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				pack.Close()
-				idx.Close()
-			})
-
-			return newPackfileOpts(pack, idx,
-				packfile.WithFs(osfs.New(t.TempDir())),
+			pack, idx, rev := openFixtureTriple(t, fixture)
+			return newPackfileOpts(pack, idx, rev,
 				packfile.WithCache(cache.NewObjectLRUDefault()))
 		},
 	})
@@ -46,17 +36,8 @@ func TestPackfileWithFSandCache(t *testing.T) {
 	fixture := fixtures.NewOSFixture(fixtures.Basic().One(), t.TempDir())
 	suite.Run(t, &PackHandlerSuite[int64]{
 		newPackHandler: func() packHandler[int64] {
-			pack, err := fixture.Packfile()
-			require.NoError(t, err)
-			idx, err := fixture.Idx()
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				pack.Close()
-				idx.Close()
-			})
-
-			return newPackfileOpts(pack, idx,
-				packfile.WithFs(osfs.New(t.TempDir())),
+			pack, idx, rev := openFixtureTriple(t, fixture)
+			return newPackfileOpts(pack, idx, rev,
 				packfile.WithCache(cache.NewObjectLRUDefault()))
 		},
 	})
@@ -67,16 +48,8 @@ func TestPackfileWithFS(t *testing.T) {
 	fixture := fixtures.NewOSFixture(fixtures.Basic().One(), t.TempDir())
 	suite.Run(t, &PackHandlerSuite[int64]{
 		newPackHandler: func() packHandler[int64] {
-			pack, err := fixture.Packfile()
-			require.NoError(t, err)
-			idx, err := fixture.Idx()
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				pack.Close()
-				idx.Close()
-			})
-
-			return newPackfileOpts(pack, idx, packfile.WithFs(osfs.New(t.TempDir())))
+			pack, idx, rev := openFixtureTriple(t, fixture)
+			return newPackfileOpts(pack, idx, rev)
 		},
 	})
 }
@@ -86,16 +59,8 @@ func TestPackfileWithCache(t *testing.T) {
 	fixture := fixtures.NewOSFixture(fixtures.Basic().One(), t.TempDir())
 	suite.Run(t, &PackHandlerSuite[int64]{
 		newPackHandler: func() packHandler[int64] {
-			pack, err := fixture.Packfile()
-			require.NoError(t, err)
-			idx, err := fixture.Idx()
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				pack.Close()
-				idx.Close()
-			})
-
-			return newPackfileOpts(pack, idx,
+			pack, idx, rev := openFixtureTriple(t, fixture)
+			return newPackfileOpts(pack, idx, rev,
 				packfile.WithCache(cache.NewObjectLRUDefault()))
 		},
 	})

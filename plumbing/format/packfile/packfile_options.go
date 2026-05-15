@@ -1,8 +1,6 @@
 package packfile
 
 import (
-	billy "github.com/go-git/go-billy/v6"
-
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
 )
@@ -23,13 +21,6 @@ func WithCache(cache cache.Object) PackfileOption {
 func WithIdx(idx idxfile.Index) PackfileOption {
 	return func(p *Packfile) {
 		p.Index = idx
-	}
-}
-
-// WithFs sets the filesystem to be used.
-func WithFs(fs billy.Filesystem) PackfileOption {
-	return func(p *Packfile) {
-		p.fs = fs
 	}
 }
 

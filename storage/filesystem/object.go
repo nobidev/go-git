@@ -18,6 +18,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v6/plumbing/format/objfile"
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/plumbing/hash"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
@@ -412,18 +413,29 @@ func (s *ObjectStorage) packfile(idx idxfile.Index, pack plumbing.Hash) (*packfi
 		return p, nil
 	}
 
-	f, err := s.dir.ObjectPack(pack)
-	if err != nil {
-		return nil, err
-	}
+	// Transitional: construct an ad-hoc PackHandle from the dotgit
+	// filesystem. T10 replaces this with s.dir.PackHandle(pack).
+	ph := s.transitionalPackHandle(pack)
 
-	p := packfile.NewPackfile(f,
+	p := packfile.NewPackfile(ph,
 		packfile.WithIdx(idx),
-		packfile.WithFs(s.dir.Fs()),
 		packfile.WithCache(s.objectCache),
 		packfile.WithObjectIDSize(pack.Size()),
 	)
 	return p, s.storePackfileInCache(pack, p)
+}
+
+// transitionalPackHandle builds a PackHandle for the given pack hash
+// using dotgit's filesystem + pack-path convention. Replaced by
+// s.dir.PackHandle(pack) in T10.
+func (s *ObjectStorage) transitionalPackHandle(pack plumbing.Hash) *packhandle.PackHandle {
+	fs := s.dir.Fs()
+	stem := fs.Join("objects", "pack", "pack-"+pack.String())
+	return packhandle.New(packhandle.Sources{
+		Pack: packhandle.PathSource(fs, stem+".pack"),
+		Idx:  packhandle.PathSource(fs, stem+".idx"),
+		Rev:  packhandle.PathSource(fs, stem+".rev"),
+	}, pack)
 }
 
 func (s *ObjectStorage) packfileFromCache(hash plumbing.Hash) *packfile.Packfile {
@@ -669,59 +681,10 @@ func (s *ObjectStorage) getFromPackfile(h plumbing.Hash, canBeDelta bool) (plumb
 	}
 
 	if canBeDelta {
-		return s.decodeDeltaObjectAt(p, offset, hash)
+		return p.DeltaObject(hash, offset)
 	}
 
 	return p.GetByOffset(offset)
-}
-
-// TODO: refactor this logic into packfile package.
-func (s *ObjectStorage) decodeDeltaObjectAt(
-	p *packfile.Packfile,
-	offset int64,
-	hash plumbing.Hash,
-) (plumbing.EncodedObject, error) {
-	scan, err := p.Scanner() //nolint:staticcheck // TODO: Refactor to avoid deprecated Scanner method
-	if err != nil {
-		return nil, err
-	}
-	err = scan.SeekFromStart(offset)
-	if err != nil {
-		return nil, err
-	}
-
-	if !scan.Scan() {
-		return nil, fmt.Errorf("failed to decode delta object")
-	}
-
-	header := scan.Data().Value().(packfile.ObjectHeader)
-
-	var base plumbing.Hash
-
-	switch header.Type {
-	case plumbing.REFDeltaObject:
-		base = header.Reference
-	case plumbing.OFSDeltaObject:
-		base, err = p.FindHash(header.OffsetReference)
-		if err != nil {
-			return nil, err
-		}
-	default:
-		return p.GetByOffset(offset)
-	}
-
-	obj := &plumbing.MemoryObject{}
-	obj.SetType(header.Type)
-	w, err := obj.Writer()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := scan.WriteObject(&header, w); err != nil {
-		return nil, err
-	}
-
-	return newDeltaObject(obj, hash, base, header.Size), nil
 }
 
 func (s *ObjectStorage) findObjectInPackfile(h plumbing.Hash) (plumbing.Hash, plumbing.Hash, int64) {
