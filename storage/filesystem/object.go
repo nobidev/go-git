@@ -18,7 +18,6 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v6/plumbing/format/objfile"
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
-	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/plumbing/hash"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
@@ -35,12 +34,13 @@ type ObjectStorage struct {
 
 	dir   *dotgit.DotGit
 	index map[plumbing.Hash]idxfile.Index
+	muI   sync.RWMutex
 
-	packList    []plumbing.Hash
-	packListIdx int
-	packfiles   map[plumbing.Hash]*packfile.Packfile
-	muI         sync.RWMutex
-	muP         sync.RWMutex
+	// packfiles caches metadata-only Packfile instances. Packfile no
+	// longer holds FDs; the cache amortises init across calls to the
+	// same pack.
+	packfiles map[plumbing.Hash]*packfile.Packfile
+	muP       sync.RWMutex
 
 	oh *plumbing.ObjectHasher
 
@@ -206,9 +206,24 @@ func (s *ObjectStorage) requireIndex() error {
 	return nil
 }
 
-// Reindex indexes again all packfiles. Useful if git changed packfiles externally
-func (s *ObjectStorage) Reindex() {
+// Reindex closes cached indexes, drops the Packfile cache, and
+// resets PackHandles. Call when the on-disk pack inventory has
+// changed externally.
+func (s *ObjectStorage) Reindex() error {
+	s.muI.Lock()
+	for _, idx := range s.index {
+		if c, ok := idx.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}
 	s.index = nil
+	s.muI.Unlock()
+
+	s.muP.Lock()
+	s.packfiles = nil
+	s.muP.Unlock()
+
+	return s.dir.ResetPackHandles()
 }
 
 func (s *ObjectStorage) loadIdxFile(h plumbing.Hash) error {
@@ -232,15 +247,12 @@ func (s *ObjectStorage) loadIdxFile(h plumbing.Hash) error {
 	return s.loadMemoryIndex(h)
 }
 
-func (s *ObjectStorage) loadLazyIndex(h plumbing.Hash) (*idxfile.LazyIndex, error) {
-	openIdx := func() (idxfile.ReadAtCloser, error) {
-		return s.dir.ObjectPackIdx(h)
+func (s *ObjectStorage) loadLazyIndex(h plumbing.Hash) (idxfile.Index, error) {
+	ph, err := s.dir.PackHandle(h)
+	if err != nil {
+		return nil, err
 	}
-	openRev := func() (idxfile.ReadAtCloser, error) {
-		return s.dir.OpenPackRev(h)
-	}
-
-	return idxfile.NewLazyIndex(openIdx, openRev, h)
+	return ph.Index()
 }
 
 func (s *ObjectStorage) loadMemoryIndex(h plumbing.Hash) (err error) {
@@ -413,82 +425,33 @@ func (s *ObjectStorage) packfile(idx idxfile.Index, pack plumbing.Hash) (*packfi
 		return p, nil
 	}
 
-	// Transitional: construct an ad-hoc PackHandle from the dotgit
-	// filesystem. T10 replaces this with s.dir.PackHandle(pack).
-	ph := s.transitionalPackHandle(pack)
+	h, err := s.dir.PackHandle(pack)
+	if err != nil {
+		return nil, err
+	}
 
-	p := packfile.NewPackfile(ph,
+	p := packfile.NewPackfile(h,
 		packfile.WithIdx(idx),
 		packfile.WithCache(s.objectCache),
 		packfile.WithObjectIDSize(pack.Size()),
 	)
-	return p, s.storePackfileInCache(pack, p)
-}
-
-// transitionalPackHandle builds a PackHandle for the given pack hash
-// using dotgit's filesystem + pack-path convention. Replaced by
-// s.dir.PackHandle(pack) in T10.
-func (s *ObjectStorage) transitionalPackHandle(pack plumbing.Hash) *packhandle.PackHandle {
-	fs := s.dir.Fs()
-	stem := fs.Join("objects", "pack", "pack-"+pack.String())
-	return packhandle.New(packhandle.Sources{
-		Pack: packhandle.PathSource(fs, stem+".pack"),
-		Idx:  packhandle.PathSource(fs, stem+".idx"),
-		Rev:  packhandle.PathSource(fs, stem+".rev"),
-	}, pack)
+	s.storePackfileInCache(pack, p)
+	return p, nil
 }
 
 func (s *ObjectStorage) packfileFromCache(hash plumbing.Hash) *packfile.Packfile {
-	s.muP.Lock()
-	defer s.muP.Unlock()
-
-	if s.packfiles == nil {
-		if s.options.KeepDescriptors {
-			s.packfiles = make(map[plumbing.Hash]*packfile.Packfile)
-		} else if s.options.MaxOpenDescriptors > 0 {
-			s.packList = make([]plumbing.Hash, s.options.MaxOpenDescriptors)
-			s.packfiles = make(map[plumbing.Hash]*packfile.Packfile, s.options.MaxOpenDescriptors)
-		}
-	}
-
+	s.muP.RLock()
+	defer s.muP.RUnlock()
 	return s.packfiles[hash]
 }
 
-func (s *ObjectStorage) storePackfileInCache(hash plumbing.Hash, p *packfile.Packfile) error {
+func (s *ObjectStorage) storePackfileInCache(hash plumbing.Hash, p *packfile.Packfile) {
 	s.muP.Lock()
 	defer s.muP.Unlock()
-
-	if s.options.KeepDescriptors {
-		s.packfiles[hash] = p
-		return nil
+	if s.packfiles == nil {
+		s.packfiles = make(map[plumbing.Hash]*packfile.Packfile)
 	}
-
-	if s.options.MaxOpenDescriptors <= 0 {
-		return nil
-	}
-
-	// start over as the limit of packList is hit
-	if s.packListIdx >= len(s.packList) {
-		s.packListIdx = 0
-	}
-
-	// close the existing packfile if open
-	if next := s.packList[s.packListIdx]; !next.IsZero() {
-		open := s.packfiles[next]
-		delete(s.packfiles, next)
-		if open != nil {
-			if err := open.Close(); err != nil {
-				return err
-			}
-		}
-	}
-
-	// cache newly open packfile
-	s.packList[s.packListIdx] = hash
 	s.packfiles[hash] = p
-	s.packListIdx++
-
-	return nil
 }
 
 func (s *ObjectStorage) encodedObjectSizeFromPackfile(h plumbing.Hash) (size int64, err error) {
@@ -515,10 +478,6 @@ func (s *ObjectStorage) encodedObjectSizeFromPackfile(h plumbing.Hash) (size int
 	p, err := s.packfile(idx, pack)
 	if err != nil {
 		return 0, err
-	}
-
-	if !s.options.KeepDescriptors && s.options.MaxOpenDescriptors == 0 {
-		defer ioutil.CheckClose(p, &err)
 	}
 
 	return p.GetSizeByOffset(offset)
@@ -676,10 +635,6 @@ func (s *ObjectStorage) getFromPackfile(h plumbing.Hash, canBeDelta bool) (plumb
 		return nil, err
 	}
 
-	if !s.options.KeepDescriptors && s.options.MaxOpenDescriptors == 0 {
-		defer ioutil.CheckClose(p, &err)
-	}
-
 	if canBeDelta {
 		return p.DeltaObject(hash, offset)
 	}
@@ -801,19 +756,23 @@ func (s *ObjectStorage) buildPackfileIters(
 	return &lazyPackfilesIter{
 		hashes: packs,
 		open: func(h plumbing.Hash) (storer.EncodedObjectIter, error) {
-			pack, err := s.dir.ObjectPack(h)
+			ph, err := s.dir.PackHandle(h)
 			if err != nil {
 				return nil, err
 			}
-			return newPackfileIter(
-				s.dir.Fs(), pack, t, seen, s.index[h],
-				s.objectCache, s.options.KeepDescriptors, h.Size(),
-			)
+			return newPackfileIter(ph, t, seen, s.index[h], s.objectCache, h.Size())
 		},
 	}, nil
 }
 
 // Close closes all opened files including cached alternate storages.
+//
+// Packfiles are metadata-only after the PackHandle FD lifecycle
+// migration; the FDs they used to hold are now owned by the
+// PackHandles in dotgit, which dir.Close releases via
+// ResetPackHandles. LazyIndex.Close releases SharedFile refcounts
+// it held for iteration; the SharedFile.Close itself is part of the
+// PackHandle terminal close path.
 func (s *ObjectStorage) Close() error {
 	var firstError error
 
@@ -825,22 +784,6 @@ func (s *ObjectStorage) Close() error {
 	}
 	s.muA.RUnlock()
 
-	s.muP.RLock()
-	defer s.muP.RUnlock()
-
-	if s.options.KeepDescriptors || s.options.MaxOpenDescriptors > 0 {
-		for _, packfile := range s.packfiles {
-			err := packfile.Close()
-			if firstError == nil && err != nil {
-				firstError = err
-			}
-		}
-	}
-
-	// If the index being used implements io.Closer, make sure we call it.
-	// LazyIndex.Close permanently disables the index and releases any
-	// idle file descriptors. The same pattern applies to other Index
-	// implementations that hold resources.
 	s.muI.RLock()
 	for _, idx := range s.index {
 		if closer, ok := idx.(io.Closer); ok {
@@ -851,9 +794,13 @@ func (s *ObjectStorage) Close() error {
 	}
 	s.muI.RUnlock()
 
+	s.muP.Lock()
 	s.packfiles = nil
-	_ = s.dir.Close()
+	s.muP.Unlock()
 
+	if err := s.dir.Close(); err != nil && firstError == nil {
+		firstError = err
+	}
 	return firstError
 }
 

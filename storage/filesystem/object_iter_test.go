@@ -3,6 +3,7 @@ package filesystem
 import (
 	"crypto"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	"github.com/go-git/go-git/v6/internal/packhandle"
 	"github.com/go-git/go-git/v6/plumbing/hash"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
 )
@@ -36,14 +38,14 @@ func TestPackfileIter_SeenSkips(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pack := pf.openPack(t)
+			ph := pf.packHandle(t)
 			seen := make(map[plumbing.Hash]struct{})
 			for _, h := range tc.preSeen(pf.hashes) {
 				seen[h] = struct{}{}
 			}
 
-			iter, err := newPackfileIter(pf.fs, pack, plumbing.AnyObject, seen, pf.idx,
-				cache.NewObjectLRUDefault(), false, crypto.SHA1.Size())
+			iter, err := newPackfileIter(ph, plumbing.AnyObject, seen, pf.idx,
+				cache.NewObjectLRUDefault(), crypto.SHA1.Size())
 			require.NoError(t, err)
 
 			var got int
@@ -63,9 +65,9 @@ func TestPackfileIter_SharedSeenDedupsAcrossIterators(t *testing.T) {
 	cch := cache.NewObjectLRUDefault()
 
 	count := func() int {
-		pack := pf.openPack(t)
-		iter, err := newPackfileIter(pf.fs, pack, plumbing.AnyObject, seen, pf.idx,
-			cch, false, crypto.SHA1.Size())
+		ph := pf.packHandle(t)
+		iter, err := newPackfileIter(ph, plumbing.AnyObject, seen, pf.idx,
+			cch, crypto.SHA1.Size())
 		require.NoError(t, err)
 
 		var n int
@@ -84,101 +86,45 @@ func TestPackfileIter_SharedSeenDedupsAcrossIterators(t *testing.T) {
 	require.Len(t, seen, len(pf.hashes))
 }
 
-func TestPackfileIter_ForEachClosesPack(t *testing.T) {
+// TestNewPackfileIter_UnconfiguredSources mirrors the idx/rev Source
+// shape that NewPackfileIter installs on its ad-hoc PackHandle: both
+// the Open and Size closures return a wrapped
+// packhandle.ErrSourceUnconfigured. Callers can therefore detect this
+// failure mode specifically via errors.Is rather than chasing an
+// accidental io.ErrUnexpectedEOF sentinel.
+func TestNewPackfileIter_UnconfiguredSources(t *testing.T) {
 	t.Parallel()
-	pf := loadPackFixture(t)
-	stopAt := len(pf.hashes) / 2
-	cbErr := errors.New("stop")
+
+	idxErr := fmt.Errorf("packhandle: NewPackfileIter: idx source: %w", packhandle.ErrSourceUnconfigured)
+	revErr := fmt.Errorf("packhandle: NewPackfileIter: rev source: %w", packhandle.ErrSourceUnconfigured)
 
 	tests := []struct {
-		name    string
-		cb      func(int) error
-		wantErr error
+		name string
+		src  packhandle.Source
 	}{
 		{
-			name:    "callback returns nil completes",
-			cb:      func(int) error { return nil },
-			wantErr: nil,
-		},
-		{
-			name:    "callback returns error aborts",
-			cb:      func(_ int) error { return cbErr },
-			wantErr: cbErr,
-		},
-		{
-			name: "callback errors midway",
-			cb: func(i int) error {
-				if i >= stopAt {
-					return cbErr
-				}
-				return nil
+			name: "idx source",
+			src: packhandle.Source{
+				Open: func() (billy.File, error) { return nil, idxErr },
+				Size: func() (int64, error) { return 0, idxErr },
 			},
-			wantErr: cbErr,
+		},
+		{
+			name: "rev source",
+			src: packhandle.Source{
+				Open: func() (billy.File, error) { return nil, revErr },
+				Size: func() (int64, error) { return 0, revErr },
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pack := &closeCounter{File: pf.openPack(t)}
-			iter, err := newPackfileIter(pf.fs, pack, plumbing.AnyObject,
-				make(map[plumbing.Hash]struct{}), pf.idx,
-				cache.NewObjectLRUDefault(), false, crypto.SHA1.Size())
-			require.NoError(t, err)
-
-			var i int
-			err = iter.ForEach(func(plumbing.EncodedObject) error {
-				defer func() { i++ }()
-				return tc.cb(i)
-			})
-			if tc.wantErr == nil {
-				require.NoError(t, err)
-			} else {
-				require.ErrorIs(t, err, tc.wantErr)
-			}
-			require.Equal(t, 1, pack.closed, "pack must be closed after ForEach returns")
-		})
-	}
-}
-
-func TestPackfileIter_ForEachKeepsPackOpen(t *testing.T) {
-	t.Parallel()
-	pf := loadPackFixture(t)
-	pack := &closeCounter{File: pf.openPack(t)}
-
-	iter, err := newPackfileIter(pf.fs, pack, plumbing.AnyObject,
-		make(map[plumbing.Hash]struct{}), pf.idx,
-		cache.NewObjectLRUDefault(), true, crypto.SHA1.Size())
-	require.NoError(t, err)
-
-	require.NoError(t, iter.ForEach(func(plumbing.EncodedObject) error { return nil }))
-	require.Zero(t, pack.closed, "keepPack=true must not close the underlying file")
-}
-
-func TestNewPackfileIter_ClosesPackOnGetByTypeError(t *testing.T) {
-	t.Parallel()
-	pf := loadPackFixture(t)
-
-	tests := []struct {
-		name        string
-		keepPack    bool
-		wantClosed  int
-		wantClosedR string
-	}{
-		{"keepPack false closes on error", false, 1, "must close when keepPack is false"},
-		{"keepPack true leaves it open", true, 0, "must not close when keepPack is true"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			pack := &closeCounter{File: pf.openPack(t)}
-			iter, err := newPackfileIter(pf.fs, pack, plumbing.OFSDeltaObject,
-				make(map[plumbing.Hash]struct{}), pf.idx,
-				cache.NewObjectLRUDefault(), tc.keepPack, crypto.SHA1.Size())
-			require.Error(t, err)
-			require.Nil(t, iter)
-			require.Equal(t, tc.wantClosed, pack.closed, tc.wantClosedR)
+			_, err := tc.src.Open()
+			require.ErrorIs(t, err, packhandle.ErrSourceUnconfigured)
+			_, err = tc.src.Size()
+			require.ErrorIs(t, err, packhandle.ErrSourceUnconfigured)
 		})
 	}
 }
@@ -262,19 +208,11 @@ func loadPackFixture(t *testing.T) packFixture {
 	return packFixture{fs: fs, dg: dg, packHash: packs[0], idx: idx, hashes: hashes}
 }
 
-func (p packFixture) openPack(t *testing.T) billy.File {
+// packHandle returns a fresh PackHandle for the fixture pack. Tests
+// register a Cleanup to close it.
+func (p packFixture) packHandle(t *testing.T) *packhandle.PackHandle {
 	t.Helper()
-	f, err := p.dg.ObjectPack(p.packHash)
+	ph, err := p.dg.PackHandle(p.packHash)
 	require.NoError(t, err)
-	return f
-}
-
-type closeCounter struct {
-	billy.File
-	closed int
-}
-
-func (c *closeCounter) Close() error {
-	c.closed++
-	return c.File.Close()
+	return ph
 }

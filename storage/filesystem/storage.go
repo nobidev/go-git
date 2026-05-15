@@ -36,11 +36,22 @@ type Options struct {
 	// ExclusiveAccess means that the filesystem is not modified externally
 	// while the repo is open.
 	ExclusiveAccess bool
-	// KeepDescriptors makes the file descriptors to be reused but they will
-	// need to be manually closed calling Close().
+	// KeepDescriptors used to make .pack file descriptors stay open
+	// across operations.
+	//
+	// Deprecated: Pack file descriptors are managed automatically by
+	// PackHandle: descriptors open lazily on first use, share across
+	// concurrent readers, and close after a 1-second idle grace
+	// period. Setting this field has no effect. Will be removed in
+	// v7.
 	KeepDescriptors bool
-	// MaxOpenDescriptors is the max number of file descriptors to keep
-	// open. If KeepDescriptors is true, all file descriptors will remain open.
+	// MaxOpenDescriptors used to cap the number of .pack file
+	// descriptors kept open in an LRU ring.
+	//
+	// Deprecated: Pack file descriptors auto-release after a
+	// 1-second idle grace period, so an explicit cap is no longer
+	// meaningful. Setting this field has no effect. Will be removed
+	// in v7.
 	MaxOpenDescriptors int
 	// LargeObjectThreshold maximum object size (in bytes) that will be read in to memory.
 	// If left unset or set to 0 there is no limit
@@ -103,7 +114,6 @@ func NewStorageWithOptions(fs billy.Filesystem, c cache.Object, ops Options) *St
 	dirOps := dotgit.Options{
 		ExclusiveAccess:   ops.ExclusiveAccess,
 		AlternatesFS:      ops.AlternatesFS,
-		KeepDescriptors:   ops.KeepDescriptors,
 		ObjectFormat:      ops.ObjectFormat,
 		ReadReverseIndex:  readRevIdx,
 		WriteReverseIndex: writeRevIdx,

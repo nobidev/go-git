@@ -92,8 +92,12 @@ type Options struct {
 	// ExclusiveAccess means that the filesystem is not modified externally
 	// while the repo is open.
 	ExclusiveAccess bool
-	// KeepDescriptors makes the file descriptors to be reused but they will
-	// need to be manually closed calling Close().
+	// KeepDescriptors used to make pack file descriptors stay open
+	// across calls to ObjectPack.
+	//
+	// Deprecated: descriptor lifecycle is now owned by
+	// packhandle.PackHandle (acquired via DotGit.PackHandle); this
+	// field has no effect. Will be removed in v7.
 	KeepDescriptors bool
 	// AlternatesFS provides the billy filesystem to be used for Git Alternates.
 	// If none is provided, it falls back to using the underlying instance used for

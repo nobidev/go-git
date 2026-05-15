@@ -380,7 +380,7 @@ func (s *FsSuite) TestPackfileIter() {
 				idxf, err := dg.ObjectPackIdx(h)
 				s.Require().NoError(err)
 
-				iter, err := NewPackfileIter(fs, f, idxf, t, false, 0, objectIDSize)
+				iter, err := NewPackfileIter(fs, f, idxf, t, 0, objectIDSize)
 				s.Require().NoError(err)
 
 				err = iter.ForEach(func(o plumbing.EncodedObject) error {
@@ -477,7 +477,7 @@ func (s *FsSuite) TestPackfileIterKeepDescriptors() {
 				idxf, err := dg.ObjectPackIdx(h)
 				s.Require().NoError(err)
 
-				iter, err := NewPackfileIter(fs, f, idxf, t, true, 0, objectIDSize)
+				iter, err := NewPackfileIter(fs, f, idxf, t, 0, objectIDSize)
 				s.Require().NoError(err)
 
 				if err != nil {
@@ -580,7 +580,7 @@ func BenchmarkPackfileIter(b *testing.B) {
 							b.Fatal(err)
 						}
 
-						iter, err := NewPackfileIter(fs, f, idxf, t, false, 0, crypto.SHA1.Size())
+						iter, err := NewPackfileIter(fs, f, idxf, t, 0, crypto.SHA1.Size())
 						if err != nil {
 							b.Fatal(err)
 						}
@@ -628,7 +628,7 @@ func BenchmarkPackfileIterReadContent(b *testing.B) {
 							b.Fatal(err)
 						}
 
-						iter, err := NewPackfileIter(fs, f, idxf, t, false, 0, crypto.SHA1.Size())
+						iter, err := NewPackfileIter(fs, f, idxf, t, 0, crypto.SHA1.Size())
 						if err != nil {
 							b.Fatal(err)
 						}
