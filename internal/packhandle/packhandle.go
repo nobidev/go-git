@@ -202,10 +202,37 @@ func (h *PackHandle) Meta() (PackMeta, error) {
 
 // Index returns the cached idxfile.Index for this pack, building
 // it on first call from sources.Idx / sources.Rev. Returns
-// ErrSourceUnconfigured if either source is unconfigured. Wired in
-// a subsequent commit.
+// ErrSourceUnconfigured if either source is unconfigured. Cached
+// via sync.Once + result fields so concurrent callers serialize
+// on the build and failures are sticky.
 func (h *PackHandle) Index() (idxfile.Index, error) {
-	return nil, errors.New("packhandle: Index wired in subsequent commit")
+	h.indexOnce.Do(func() {
+		h.indexVal, h.indexErr = h.buildIndex()
+	})
+	return h.indexVal, h.indexErr
+}
+
+func (h *PackHandle) buildIndex() (idxfile.Index, error) {
+	if h.sources.Idx.Open == nil {
+		return nil, fmt.Errorf("packhandle: Index: idx source: %w", ErrSourceUnconfigured)
+	}
+	if h.sources.Rev.Open == nil {
+		return nil, fmt.Errorf("packhandle: Index: rev source: %w", ErrSourceUnconfigured)
+	}
+	// idxfile.NewLazyIndex expects openers returning idxfile.ReadAtCloser.
+	// billy.File satisfies that interface implicitly (it has ReadAt,
+	// Read, Close), so forward the Source openers via thin adapters.
+	idx, err := idxfile.NewLazyIndex(
+		func() (idxfile.ReadAtCloser, error) { return h.sources.Idx.Open() },
+		func() (idxfile.ReadAtCloser, error) { return h.sources.Rev.Open() },
+		h.packHash,
+	)
+	if err != nil {
+		// Force a nil idxfile.Index interface on error so PackHandle.Close
+		// doesn't see a non-nil typed-nil and call Close on it.
+		return nil, err
+	}
+	return idx, nil
 }
 
 // Close marks the pack sharedFile permanently closed and releases

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -461,6 +462,120 @@ func TestPackHandle_Meta_ErrorCached(t *testing.T) {
 		require.Error(t, err)
 	}
 	assert.Equal(t, int32(1), calls.Load(), "Meta error must be cached (sync.OnceValues)")
+}
+
+func TestPackHandle_Index_UnconfiguredIdx(t *testing.T) {
+	t.Parallel()
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", []byte("pack"))
+	// Only Pack configured; Idx and Rev are zero Sources.
+	ph := New(Sources{Pack: PathSource(fs, "p.pack")}, plumbing.ZeroHash)
+	defer ph.Close()
+
+	idx, err := ph.Index()
+	require.Nil(t, idx)
+	assert.ErrorIs(t, err, ErrSourceUnconfigured)
+	assert.Contains(t, err.Error(), "idx source")
+}
+
+func TestPackHandle_Index_UnconfiguredRev(t *testing.T) {
+	t.Parallel()
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", []byte("pack"))
+	writeMemFile(t, fs, "p.idx", []byte("idx"))
+	// Idx configured; Rev is a zero Source.
+	ph := New(Sources{
+		Pack: PathSource(fs, "p.pack"),
+		Idx:  PathSource(fs, "p.idx"),
+	}, plumbing.ZeroHash)
+	defer ph.Close()
+
+	idx, err := ph.Index()
+	require.Nil(t, idx)
+	assert.ErrorIs(t, err, ErrSourceUnconfigured)
+	assert.Contains(t, err.Error(), "rev source")
+}
+
+func TestPackHandle_Index_ErrorCached(t *testing.T) {
+	t.Parallel()
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", []byte("pack"))
+
+	var idxCalls atomic.Int32
+	wantErr := errors.New("synthetic idx open failure")
+	srcs := Sources{
+		Pack: PathSource(fs, "p.pack"),
+		Idx: Source{
+			Open: func() (billy.File, error) {
+				idxCalls.Add(1)
+				return nil, wantErr
+			},
+			Size: func() (int64, error) { return 0, wantErr },
+		},
+		Rev: Source{
+			Open: func() (billy.File, error) { return nil, wantErr },
+			Size: func() (int64, error) { return 0, wantErr },
+		},
+	}
+	ph := New(srcs, plumbing.ZeroHash)
+	defer ph.Close()
+
+	_, err1 := ph.Index()
+	_, err2 := ph.Index()
+	require.Error(t, err1)
+	require.Error(t, err2)
+	// Idx opener invoked exactly once across calls (sync.Once gate).
+	assert.Equal(t, int32(1), idxCalls.Load(), "Index error must be cached")
+}
+
+func TestPackHandle_Index_Concurrent(t *testing.T) {
+	t.Parallel()
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", []byte("pack"))
+
+	var idxCalls atomic.Int32
+	wantErr := errors.New("synthetic")
+	srcs := Sources{
+		Pack: PathSource(fs, "p.pack"),
+		Idx: Source{
+			Open: func() (billy.File, error) {
+				idxCalls.Add(1)
+				return nil, wantErr
+			},
+			Size: func() (int64, error) { return 0, wantErr },
+		},
+		Rev: Source{
+			Open: func() (billy.File, error) { return nil, wantErr },
+			Size: func() (int64, error) { return 0, wantErr },
+		},
+	}
+	ph := New(srcs, plumbing.ZeroHash)
+	defer ph.Close()
+
+	const N = 32
+	results := make([]idxfileIndexResult, N)
+	var wg sync.WaitGroup
+	for i := range N {
+		wg.Go(func() {
+			idx, err := ph.Index()
+			results[i] = idxfileIndexResult{idx: idx, err: err}
+		})
+	}
+	wg.Wait()
+
+	// All N goroutines observe the same (nil, error) tuple.
+	for i := range N {
+		assert.Nil(t, results[i].idx)
+		require.Error(t, results[i].err)
+		assert.Equal(t, results[0].err.Error(), results[i].err.Error())
+	}
+	// And the opener was called exactly once across all of them.
+	assert.Equal(t, int32(1), idxCalls.Load(), "race-protected: exactly one build")
+}
+
+type idxfileIndexResult struct {
+	idx any
+	err error
 }
 
 func TestPackHandle_ClosePartialInit_NeitherCalled(t *testing.T) {
