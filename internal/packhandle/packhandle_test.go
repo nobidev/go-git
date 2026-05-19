@@ -2,6 +2,8 @@ package packhandle
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/binary"
 	"errors"
 	"io"
 	"io/fs"
@@ -18,6 +20,25 @@ import (
 
 	"github.com/go-git/go-git/v6/plumbing"
 )
+
+// buildEmptyPack returns (packBytes, packHash) for a minimal valid
+// pack with zero objects. Pack version 2, empty object section,
+// SHA1 footer hash over the 12-byte header.
+func buildEmptyPack(t *testing.T) ([]byte, plumbing.Hash) {
+	t.Helper()
+	header := make([]byte, 12)
+	copy(header[0:4], "PACK")
+	binary.BigEndian.PutUint32(header[4:8], 2)
+	binary.BigEndian.PutUint32(header[8:12], 0)
+	sum := sha1.Sum(header)
+	pack := append([]byte{}, header...)
+	pack = append(pack, sum[:]...)
+	var h plumbing.Hash
+	h.ResetBySize(20)
+	_, err := h.Write(sum[:])
+	require.NoError(t, err)
+	return pack, h
+}
 
 // instrumentedSource wraps a PathSource with atomic counters for
 // opens and size queries, used by timer-independence tests.
@@ -336,6 +357,110 @@ func TestPackHandle_ClosePartialInit_OpenPackReaderOnly(t *testing.T) {
 
 	require.NoError(t, ph.Close(), "Close after only-pack-reader use should not panic")
 	require.NoError(t, ph.Close(), "second Close should be idempotent")
+}
+
+func TestPackHandle_Meta_HappyPath(t *testing.T) {
+	t.Parallel()
+	packBytes, packHash := buildEmptyPack(t)
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", packBytes)
+
+	ph := New(Sources{Pack: PathSource(fs, "p.pack")}, packHash)
+	defer ph.Close()
+
+	meta, err := ph.Meta()
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), meta.Version)
+	assert.Equal(t, uint32(0), meta.Count)
+	assert.True(t, meta.ID.Equal(packHash))
+}
+
+func TestPackHandle_Meta_Cached(t *testing.T) {
+	t.Parallel()
+	packBytes, packHash := buildEmptyPack(t)
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", packBytes)
+
+	packSrc, _, sizes := instrumentedSource(fs, "p.pack")
+	ph := New(Sources{Pack: packSrc}, packHash)
+	defer ph.Close()
+
+	for range 5 {
+		_, err := ph.Meta()
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int32(1), sizes.Load(), "Size invoked exactly once across cached calls")
+}
+
+func TestPackHandle_Meta_HashMismatch(t *testing.T) {
+	t.Parallel()
+	packBytes, _ := buildEmptyPack(t)
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", packBytes)
+
+	// Pin a deliberately wrong hash.
+	var wrong plumbing.Hash
+	wrong.ResetBySize(20)
+	bogus := bytes.Repeat([]byte{0xff}, 20)
+	_, err := wrong.Write(bogus)
+	require.NoError(t, err)
+
+	ph := New(Sources{Pack: PathSource(fs, "p.pack")}, wrong)
+	defer ph.Close()
+
+	_, err = ph.Meta()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match expected")
+}
+
+func TestPackHandle_Meta_TooShort(t *testing.T) {
+	t.Parallel()
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", []byte("PACK")) // shorter than 12+hashSize
+	ph := New(Sources{Pack: PathSource(fs, "p.pack")}, plumbing.ZeroHash)
+	defer ph.Close()
+
+	_, err := ph.Meta()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "too short")
+}
+
+func TestPackHandle_Meta_BadSignature(t *testing.T) {
+	t.Parallel()
+	bad := make([]byte, 12+20)
+	copy(bad, "NOPE")
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", bad)
+	ph := New(Sources{Pack: PathSource(fs, "p.pack")}, plumbing.ZeroHash)
+	defer ph.Close()
+
+	_, err := ph.Meta()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "bad pack signature")
+}
+
+func TestPackHandle_Meta_ErrorCached(t *testing.T) {
+	t.Parallel()
+	fs := memfs.New()
+	writeMemFile(t, fs, "p.pack", []byte("pack-too-short"))
+
+	base := PathSource(fs, "p.pack")
+	var calls atomic.Int32
+	src := Source{
+		Open: base.Open,
+		Size: func() (int64, error) {
+			calls.Add(1)
+			return 0, errors.New("transient stat failure")
+		},
+	}
+	ph := New(Sources{Pack: src}, plumbing.ZeroHash)
+	defer ph.Close()
+
+	for range 3 {
+		_, err := ph.Meta()
+		require.Error(t, err)
+	}
+	assert.Equal(t, int32(1), calls.Load(), "Meta error must be cached (sync.OnceValues)")
 }
 
 func TestPackHandle_ClosePartialInit_NeitherCalled(t *testing.T) {

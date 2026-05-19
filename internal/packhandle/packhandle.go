@@ -1,7 +1,10 @@
 package packhandle
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -122,11 +125,63 @@ func New(sources Sources, packHash plumbing.Hash) *PackHandle {
 		hashSize: packHash.Size(),
 		pack:     newSharedFile(sources.Pack.Open),
 	}
-	// meta is wired by the next commit (cd702a2c equivalent).
-	h.meta = func() (PackMeta, error) {
-		return PackMeta{}, errors.New("packhandle: Meta wired in subsequent commit")
-	}
+	h.meta = sync.OnceValues(func() (PackMeta, error) {
+		return computeMeta(h)
+	})
 	return h
+}
+
+// computeMeta reads the pack header (12 bytes at offset 0) and the
+// footer hash (hashSize bytes at offset size-hashSize) in a single
+// sharedFile acquire. Verifies the footer hash against the pinned
+// packHash; mismatch surfaces a clear error early.
+func computeMeta(h *PackHandle) (PackMeta, error) {
+	size, err := h.sources.Pack.Size()
+	if err != nil {
+		return PackMeta{}, fmt.Errorf("packhandle: stat pack: %w", err)
+	}
+	if size < int64(12+h.hashSize) {
+		return PackMeta{}, fmt.Errorf("packhandle: pack file too short: %d bytes", size)
+	}
+
+	ra, err := h.pack.acquire()
+	if err != nil {
+		return PackMeta{}, err
+	}
+	defer h.pack.release()
+
+	var header [12]byte
+	if _, err := ra.ReadAt(header[:], 0); err != nil {
+		return PackMeta{}, fmt.Errorf("packhandle: read pack header: %w", err)
+	}
+	if !bytes.Equal(header[0:4], []byte{'P', 'A', 'C', 'K'}) {
+		return PackMeta{}, fmt.Errorf("packhandle: bad pack signature %q", header[0:4])
+	}
+
+	footer := make([]byte, h.hashSize)
+	if _, err := ra.ReadAt(footer, size-int64(h.hashSize)); err != nil {
+		return PackMeta{}, fmt.Errorf("packhandle: read pack footer: %w", err)
+	}
+
+	meta := PackMeta{
+		Version: binary.BigEndian.Uint32(header[4:8]),
+		Count:   binary.BigEndian.Uint32(header[8:12]),
+	}
+	meta.ID.ResetBySize(h.hashSize)
+	if _, err := meta.ID.Write(footer); err != nil {
+		return PackMeta{}, fmt.Errorf("packhandle: hash footer: %w", err)
+	}
+
+	// Verify against the pinned packHash. Mismatch indicates a
+	// mis-wired Source or corrupted pack; surface early. Skip
+	// verification when the pinned hash is zero — that path is the
+	// open-pack-only iter case where the caller did not yet know
+	// the hash.
+	if !h.packHash.IsZero() && !meta.ID.Equal(h.packHash) {
+		return PackMeta{}, fmt.Errorf("packhandle: footer hash %s does not match expected %s", meta.ID, h.packHash)
+	}
+
+	return meta, nil
 }
 
 // OpenPackReader returns a refcount-holding reader over the .pack
