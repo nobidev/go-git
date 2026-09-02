@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 
+	"golang.org/x/net/idna"
+
 	transport "github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/utils/trace"
 )
@@ -106,8 +108,7 @@ func applyRedirect(resp *http.Response, baseURL *url.URL) (*url.URL, error) {
 	if final.Scheme != "http" && final.Scheme != "https" {
 		return nil, fmt.Errorf("http transport: redirect to unsupported scheme %q", final.Scheme)
 	}
-	if final.Scheme != baseURL.Scheme &&
-		(baseURL.Scheme != "http" || final.Scheme != "https") {
+	if final.Scheme != baseURL.Scheme && !schemeUpgrade(baseURL.Scheme, final.Scheme) {
 		return nil, fmt.Errorf(
 			"http transport: redirect changes scheme from %q to %q",
 			baseURL.Scheme, final.Scheme,
@@ -119,6 +120,93 @@ func applyRedirect(resp *http.Response, baseURL *url.URL) (*url.URL, error) {
 	redirected.Scheme = final.Scheme
 	redirected.Path = final.Path[:len(final.Path)-len(infoRefsPath)]
 	return &redirected, nil
+}
+
+// schemeUpgrade reports whether the scheme transition from one URL to
+// another is the one cross-scheme change go-git permits: a plain-http
+// origin upgrading to https. It strictly improves confidentiality and is
+// how servers steer clients off cleartext.
+//
+// applyRedirect ("may this become the new base URL?") and
+// credentialsMayFollow ("may credentials travel here?") are both built on it,
+// so the two cannot drift apart.
+func schemeUpgrade(from, to string) bool {
+	return strings.EqualFold(from, "http") && strings.EqualFold(to, "https")
+}
+
+// canonicalHost returns u's hostname in the form the connection will actually
+// use: IDNA-normalised and lowercased, with any trailing root dot removed.
+//
+// Comparing hostnames with strings.EqualFold is not sufficient. Unicode simple
+// folding treats U+03C2/U+03C3 and U+00DF/U+1E9E as equal, while IDNA maps
+// them to different registrable domains — so an EqualFold comparison would
+// call two hosts the same origin when net/http will dial different servers.
+//
+// Hosts that are not valid IDNA names — IPv6 literals, hosts containing
+// underscores — fall back to an ASCII-lowercased comparison of the raw form.
+// That is never looser than an exact match: two identical spellings compare
+// equal, and anything else counts as a different origin.
+func canonicalHost(u *url.URL) string {
+	host := strings.TrimSuffix(u.Hostname(), ".")
+	if ascii, err := idna.Lookup.ToASCII(host); err == nil {
+		return ascii
+	}
+	return asciiLower(host)
+}
+
+// asciiLower lowercases ASCII letters only. Unlike strings.ToLower it applies
+// no Unicode case mapping, so it can never map two distinct hostnames onto
+// each other.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+// effectivePort returns u's port as the connection will use it: the scheme's
+// well-known port when the URL does not spell one out, and without leading
+// zeroes, so "https://x", "https://x:443" and "https://x:0443" all agree.
+func effectivePort(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			return "80"
+		case "https":
+			return "443"
+		default:
+			return ""
+		}
+	}
+	if trimmed := strings.TrimLeft(port, "0"); trimmed != "" {
+		return trimmed
+	}
+	return "0"
+}
+
+// credentialsMayFollow reports whether credentials issued for one URL may be
+// sent to another.
+//
+// The relation is deliberately asymmetric: scheme, host and effective port
+// must all match, except that a plain http origin may upgrade to https on
+// the same host (see schemeUpgrade), mirroring applyRedirect.
+//
+// Host matching is exact. Unlike Go's http.Client, which forwards credentials
+// from a host to any subdomain of it, a subdomain is a different origin here —
+// matching canonical git and libcurl.
+func credentialsMayFollow(from, to *url.URL) bool {
+	if canonicalHost(from) != canonicalHost(to) {
+		return false
+	}
+	if strings.EqualFold(from.Scheme, to.Scheme) {
+		return effectivePort(from) == effectivePort(to)
+	}
+	return schemeUpgrade(from.Scheme, to.Scheme) &&
+		effectivePort(from) == "80" && effectivePort(to) == "443"
 }
 
 var safeHeaders = map[string]struct{}{
