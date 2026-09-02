@@ -143,9 +143,10 @@ func schemeUpgrade(from, to string) bool {
 // call two hosts the same origin when net/http will dial different servers.
 //
 // Hosts that are not valid IDNA names — IPv6 literals, hosts containing
-// underscores — fall back to an ASCII-lowercased comparison of the raw form.
-// That is never looser than an exact match: two identical spellings compare
-// equal, and anything else counts as a different origin.
+// underscores — fall back to an ASCII-lowercased, case-insensitive comparison
+// of the raw form: two spellings that differ only in ASCII case compare
+// equal, and anything else counts as a different origin. DNS is itself
+// case-insensitive, so this is not looser than the connection actually made.
 func canonicalHost(u *url.URL) string {
 	host := strings.TrimSuffix(u.Hostname(), ".")
 	if ascii, err := idna.Lookup.ToASCII(host); err == nil {
@@ -213,7 +214,11 @@ func credentialsMayFollow(from, to *url.URL) bool {
 // caller credential. It has two consumers: trace.HTTP logs only these, and
 // stripCredentials keeps only these when a redirect leaves the credential's
 // origin. Adding a name here makes it both loggable and forwardable across an
-// origin boundary — do not add anything a caller can put a secret in.
+// origin boundary — do not add anything a caller can put a secret in. This
+// narrows rather than eliminates the exposure: an Authorizer that writes a
+// credential into one of these names directly — for example
+// Header.Set("User-Agent", "token "+secret) — still survives a cross-origin
+// redirect and still gets logged.
 var safeHeaders = map[string]struct{}{
 	"User-Agent":        {},
 	"Host":              {},
