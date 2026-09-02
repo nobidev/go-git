@@ -1,8 +1,10 @@
 package http
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -234,7 +236,6 @@ func TestCredentialsMayFollow(t *testing.T) {
 		{"trailing root dot", "https://example.test/a", "https://example.test./a", true},
 		{"uppercase host", "https://EXAMPLE.test/a", "https://example.test/a", true},
 		{"unicode host, same spelling", "https://ẞexample.test/a", "https://ẞexample.test/a", true},
-		{"punycode equals unicode", "https://xn--xample-20e.test/a", "https://ςxample.test/a", true},
 		{"http to https upgrade", "http://example.test/a", "https://example.test/a", true},
 		{"ipv4 literal", "http://127.0.0.1:8080/a", "http://127.0.0.1:8080/a", true},
 		{"ipv6 literal", "http://[::1]:8080/a", "http://[::1]:8080/a", true},
@@ -248,11 +249,12 @@ func TestCredentialsMayFollow(t *testing.T) {
 		{"suffix but not subdomain", "https://example.test/a", "https://notexample.test/a", false},
 		{"upgrade to a non-default https port", "http://example.test/a", "https://example.test:8443/a", false},
 
-		// strings.EqualFold treats these pairs as equal, but IDNA maps them to
-		// different registrable domains, so net/http dials different servers.
-		// Comparing with EqualFold would call them the same origin.
-		{"greek final sigma fold pair", "https://ςxample.test/a", "https://σxample.test/a", false},
-		{"sharp s fold pair", "https://ẞexample.test/a", "https://ßexample.test/a", false},
+		// Hosts here are deliberately ASCII. Which internationalised hosts
+		// IDNA maps together depends on its Unicode tables and on whether
+		// the profile applies transitional processing, both of which change
+		// between x/net releases, so a hard-coded expectation for such a
+		// pair is not stable. TestCanonicalHostTracksDialTarget covers those
+		// against net/http's own normalisation instead.
 	}
 
 	for _, tt := range tests {
@@ -293,4 +295,136 @@ func TestEffectivePort(t *testing.T) {
 			assert.Equal(t, tt.want, effectivePort(u))
 		})
 	}
+}
+
+// dialTarget returns the host net/http resolves rawURL to immediately before
+// it opens a connection. It is captured from a real http.Client round trip
+// whose dialer records the address and then refuses to connect, so it is
+// net/http's own normalisation rather than a reimplementation of it.
+func dialTarget(t *testing.T, rawURL string) string {
+	t.Helper()
+
+	var addr string
+	client := &http.Client{Transport: &http.Transport{
+		DialContext: func(_ context.Context, _, a string) (net.Conn, error) {
+			addr = a
+			return nil, errors.New("dial refused by test")
+		},
+	}}
+
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.Error(t, err, "the test dialer should have refused the connection")
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.NotEmpty(t, addr, "net/http never dialled for %s", rawURL)
+
+	host, _, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+	return host
+}
+
+// TestCanonicalHostTracksDialTarget pins the invariant the whole origin
+// comparison rests on: canonicalHost must call two hosts the same origin
+// exactly when net/http would open a connection to the same server.
+//
+// Expectations are derived from net/http at run time rather than hard-coded,
+// because which internationalised hosts IDNA maps together depends on its
+// Unicode tables and on transitional processing, and those change between
+// x/net releases. A table of constants for such hosts passes on one release
+// and fails on the next without anything being wrong — which is exactly what
+// happened to an earlier version of this test. Deriving the expectation makes
+// the property hold across releases: if a release starts mapping a pair
+// differently, net/http and canonicalHost move together and the test still
+// passes; if they ever disagree, it fails, which is the bug worth catching.
+//
+// net/http's normalisation is relaxed here by the two things DNS itself
+// treats as equivalent — ASCII case and the trailing root dot — because those
+// are the only liberties canonicalHost takes beyond it.
+func TestCanonicalHostTracksDialTarget(t *testing.T) {
+	t.Parallel()
+
+	hosts := []string{
+		// Spellings that must come out equal: ASCII case, the trailing root
+		// dot, and punycode against the unicode form it encodes.
+		"example.test",
+		"EXAMPLE.test",
+		"example.test.",
+		"EXAMPLE.TEST.",
+		"sub.example.test",
+		"SUB.EXAMPLE.test",
+		"xn--xample-20e.test",
+		"XN--XAMPLE-20E.test",
+
+		// Spellings whose relationship depends on the IDNA tables, which is
+		// why nothing here is hard-coded.
+		"ςxample.test",  // U+03C2 greek final sigma
+		"σxample.test",  // U+03C3 greek small sigma
+		"ẞexample.test", // U+1E9E capital sharp s
+		"ßexample.test", // U+00DF small sharp s
+
+		// Spellings that must come out different.
+		"notexample.test",
+		"evil.test",
+
+		// Hosts IDNA rejects, exercising the fallback.
+		"127.0.0.1",
+		"[::1]",
+		"build_host",
+	}
+
+	dialed := make(map[string]string, len(hosts))
+	parsed := make(map[string]*url.URL, len(hosts))
+	for _, h := range hosts {
+		u, err := url.Parse("http://" + h + "/repo.git")
+		require.NoError(t, err, "host %q", h)
+		parsed[h] = u
+		dialed[h] = dialTarget(t, u.String())
+	}
+
+	// dnsEquivalent reports whether net/http would reach the same server for
+	// two hosts, ignoring the ASCII case and the root dot that DNS ignores.
+	dnsEquivalent := func(a, b string) bool {
+		return asciiLower(strings.TrimSuffix(a, ".")) == asciiLower(strings.TrimSuffix(b, "."))
+	}
+
+	var same, different, foldTraps int
+	for i := range hosts {
+		for j := i + 1; j < len(hosts); j++ {
+			a, b := hosts[i], hosts[j]
+
+			want := dnsEquivalent(dialed[a], dialed[b])
+			got := canonicalHost(parsed[a]) == canonicalHost(parsed[b])
+			assert.Equal(t, want, got,
+				"canonicalHost disagreed with net/http: %q dials %q, %q dials %q",
+				a, dialed[a], b, dialed[b])
+
+			if want {
+				same++
+			} else {
+				different++
+			}
+
+			// Pairs that strings.EqualFold would conflate but net/http keeps
+			// apart are the ones that make comparing hostnames by case-folding
+			// unsafe. Asserted only when the running x/net actually produces
+			// such a pair, so a table change cannot fail this spuriously.
+			if !want && strings.EqualFold(a, b) {
+				foldTraps++
+				assert.False(t, got,
+					"case-folding would conflate %q and %q, but net/http dials %q and %q",
+					a, b, dialed[a], dialed[b])
+			}
+		}
+	}
+
+	// Guard against the corpus degenerating into a one-sided test. Both counts
+	// are guaranteed non-zero by pairs that need no IDNA at all
+	// (example.test/EXAMPLE.test and example.test/evil.test).
+	require.NotZero(t, same, "corpus exercised no same-origin pairs")
+	require.NotZero(t, different, "corpus exercised no different-origin pairs")
+	t.Logf("compared %d host pairs against net/http: %d same, %d different, %d case-fold traps",
+		same+different, same, different, foldTraps)
 }

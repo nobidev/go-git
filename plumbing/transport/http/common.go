@@ -138,9 +138,11 @@ func schemeUpgrade(from, to string) bool {
 // use: IDNA-normalised and lowercased, with any trailing root dot removed.
 //
 // Comparing hostnames with strings.EqualFold is not sufficient. Unicode simple
-// folding treats U+03C2/U+03C3 and U+00DF/U+1E9E as equal, while IDNA maps
-// them to different registrable domains — so an EqualFold comparison would
-// call two hosts the same origin when net/http will dial different servers.
+// folding treats U+03C2 and U+03C3 as equal, while IDNA maps them to different
+// registrable domains — so an EqualFold comparison would call two hosts the
+// same origin when net/http will dial different servers. Normalising through
+// the same function net/http dials with keeps the two in step whichever pairs
+// a given x/net release happens to separate.
 //
 // Hosts that are not valid IDNA names — IPv6 literals, hosts containing
 // underscores — fall back to an ASCII-lowercased, case-insensitive comparison
