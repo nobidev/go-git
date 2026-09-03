@@ -517,6 +517,29 @@ func newRequest(method, rawURL string, body io.Reader) (*http.Request, error) {
 }
 
 func checkRedirect(req *http.Request, via []*http.Request, policy RedirectPolicy) error {
+	// CheckRedirect is the only hook that runs before the next hop leaves
+	// the client. ModifyEndpointIfRedirect inspects the chain after
+	// client.Do has followed all of it, so a hop rejected there has already
+	// carried the request headers to its server.
+	//
+	// The wording matches the message ModifyEndpointIfRedirect produces for
+	// the same hop, which this check reaches first.
+	if len(via) != 0 {
+		// A hop whose URL cannot be read cannot be shown not to have been
+		// https, so it is assumed to have been, and a cleartext target is
+		// rejected. Skipping the comparison instead would let an
+		// undeterminable hop turn the check off, which is the wrong default
+		// for a credential control; crossedOrigin fails closed the same way.
+		prevScheme := "https"
+		if prev := via[len(via)-1]; prev.URL != nil {
+			prevScheme = prev.URL.Scheme
+		}
+		if prevScheme == "https" && req.URL.Scheme == "http" {
+			return fmt.Errorf("http redirect: changes scheme from %q to %q: %s",
+				prevScheme, req.URL.Scheme, redactedURL(req.URL))
+		}
+	}
+
 	switch policy {
 	case FollowRedirects:
 	case NoFollowRedirects:
