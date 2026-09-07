@@ -6,12 +6,14 @@ import (
 	"crypto/sha1"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 	"github.com/go-git/go-git/v6/plumbing/protocol/capability"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
@@ -30,6 +32,20 @@ const receivePackTestHash = "0123456789012345678901234567890123456789"
 func receivePackRequest(t *testing.T, cmds []*packp.Command, extra ...capability.Capability) io.ReadCloser {
 	t.Helper()
 
+	// A zero-object packfile: the "PACK" signature, version 2 and an object
+	// count of 0, followed by the SHA-1 of those twelve bytes.
+	header := []byte("PACK\x00\x00\x00\x02\x00\x00\x00\x00")
+	sum := sha1.Sum(header)
+
+	return receivePackBody(t, cmds, append(header, sum[:]...), extra...)
+}
+
+// receivePackBody builds a wire-format receive-pack body carrying pack where
+// the packfile belongs, so a caller can hand receive-pack something that will
+// not decode. The pack is written only if some command needs one.
+func receivePackBody(t *testing.T, cmds []*packp.Command, pack []byte, extra ...capability.Capability) io.ReadCloser {
+	t.Helper()
+
 	caps := capability.List{}
 	caps.Add(capability.ReportStatus)
 	for _, c := range extra {
@@ -46,12 +62,7 @@ func receivePackRequest(t *testing.T, cmds []*packp.Command, extra ...capability
 
 	for _, cmd := range cmds {
 		if cmd.Action() != packp.Delete {
-			// A zero-object packfile: the "PACK" signature, version 2 and an
-			// object count of 0, followed by the SHA-1 of those twelve bytes.
-			header := []byte("PACK\x00\x00\x00\x02\x00\x00\x00\x00")
-			sum := sha1.Sum(header)
-			buf.Write(header)
-			buf.Write(sum[:])
+			buf.Write(pack)
 			break
 		}
 	}
@@ -583,4 +594,302 @@ func TestReceivePackAcceptsWellFormedRefs(t *testing.T) {
 			assert.ErrorIs(t, refErr, plumbing.ErrReferenceNotFound)
 		})
 	}
+}
+
+// closeCountingWriter records how often the response was closed, which is what
+// ends it for a real caller's transport, and can fail the close on demand.
+type closeCountingWriter struct {
+	buf      bytes.Buffer
+	closes   int
+	closeErr error
+	writeErr error
+}
+
+func (w *closeCountingWriter) Write(p []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.buf.Write(p)
+}
+
+func (w *closeCountingWriter) Close() error {
+	w.closes++
+	return w.closeErr
+}
+
+// receivePackRequestWithoutReportStatus builds a request that advertises no
+// capabilities at all, so ReceivePack returns before it writes a status.
+func receivePackRequestWithoutReportStatus(t *testing.T, cmds []*packp.Command) io.ReadCloser {
+	t.Helper()
+
+	req := &packp.UpdateRequests{Capabilities: capability.List{}, Commands: cmds}
+	var buf bytes.Buffer
+	require.NoError(t, req.Encode(&buf))
+	return io.NopCloser(&buf)
+}
+
+// TestReceivePackClosesWriterOnEveryExit pins the contract that every return
+// from ReceivePack closes the writer exactly once, the early ones that never
+// write a byte included: a caller whose transport ends the response on close
+// would otherwise leave a client reading a stream that never ends.
+func TestReceivePackClosesWriterOnEveryExit(t *testing.T) {
+	t.Parallel()
+
+	ref := plumbing.ReferenceName("refs/heads/main")
+	hash := plumbing.NewHash(receivePackTestHash)
+
+	noBody := func(*testing.T) io.ReadCloser { return nil }
+
+	tests := []struct {
+		name    string
+		body    func(*testing.T) io.ReadCloser
+		opts    *ReceivePackRequest
+		wantErr bool
+	}{
+		{
+			name:    "nil reader",
+			body:    noBody,
+			opts:    &ReceivePackRequest{StatelessRPC: true},
+			wantErr: true,
+		},
+		{
+			name: "advertisement only",
+			body: noBody,
+			opts: &ReceivePackRequest{AdvertiseRefs: true, StatelessRPC: true},
+		},
+		{
+			name: "client sends flush",
+			body: func(t *testing.T) io.ReadCloser {
+				var buf bytes.Buffer
+				require.NoError(t, pktline.WriteFlush(&buf))
+				return io.NopCloser(&buf)
+			},
+			opts: &ReceivePackRequest{StatelessRPC: true},
+		},
+		{
+			name: "malformed request",
+			body: func(t *testing.T) io.ReadCloser {
+				var buf bytes.Buffer
+				_, err := pktline.WriteString(&buf, "junk\n")
+				require.NoError(t, err)
+				return io.NopCloser(&buf)
+			},
+			opts:    &ReceivePackRequest{StatelessRPC: true},
+			wantErr: true,
+		},
+		{
+			name: "no report-status capability",
+			body: func(t *testing.T) io.ReadCloser {
+				return receivePackRequestWithoutReportStatus(t,
+					[]*packp.Command{deleteCmd(ref, hash)})
+			},
+			opts: &ReceivePackRequest{StatelessRPC: true},
+		},
+		{
+			name: "reference updated",
+			body: func(t *testing.T) io.ReadCloser {
+				return receivePackRequest(t, []*packp.Command{deleteCmd(ref, hash)})
+			},
+			opts: &ReceivePackRequest{StatelessRPC: true},
+		},
+		{
+			name: "refname refused",
+			body: func(t *testing.T) io.ReadCloser {
+				return receivePackRequest(t, []*packp.Command{
+					{Name: plumbing.HEAD, Old: plumbing.ZeroHash, New: hash},
+				})
+			},
+			opts:    &ReceivePackRequest{StatelessRPC: true},
+			wantErr: true,
+		},
+		{
+			name: "pre-receive rejects",
+			body: func(t *testing.T) io.ReadCloser {
+				return receivePackRequest(t, []*packp.Command{deleteCmd(ref, hash)})
+			},
+			opts: &ReceivePackRequest{
+				StatelessRPC: true,
+				Hooks: ReceivePackHooks{
+					PreReceive: func(context.Context, *PreReceiveInfo) error {
+						return errors.New("refused by policy")
+					},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			w := &closeCountingWriter{}
+			err := ReceivePack(context.Background(), seedRef(t, ref, hash),
+				tc.body(t), w, tc.opts)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			assert.Equal(t, 1, w.closes, "writer must be closed exactly once")
+		})
+	}
+}
+
+// TestReceivePackClosesWriterWhenStatusFails covers the exit a failed status
+// write takes. The report never reaches the client there, which leaves the
+// close as the only thing that can end the response.
+func TestReceivePackClosesWriterWhenStatusFails(t *testing.T) {
+	t.Parallel()
+
+	ref := plumbing.ReferenceName("refs/heads/main")
+	hash := plumbing.NewHash(receivePackTestHash)
+	writeErr := errors.New("connection reset")
+
+	w := &closeCountingWriter{writeErr: writeErr}
+	err := ReceivePack(context.Background(), seedRef(t, ref, hash),
+		receivePackRequest(t, []*packp.Command{deleteCmd(ref, hash)}),
+		w, &ReceivePackRequest{StatelessRPC: true})
+
+	require.ErrorIs(t, err, writeErr)
+	assert.Equal(t, 1, w.closes, "writer must be closed when the status write fails")
+}
+
+// TestReceivePackCloseErrorYieldsToRequestError keeps the close from speaking
+// over the exchange it ends: a refused ref describes the push, while a failure
+// to hang up only describes the caller's own writer.
+func TestReceivePackCloseErrorYieldsToRequestError(t *testing.T) {
+	t.Parallel()
+
+	ref := plumbing.ReferenceName("refs/heads/main")
+	hash := plumbing.NewHash(receivePackTestHash)
+	closeErr := errors.New("broken pipe")
+
+	t.Run("surfaces when nothing else failed", func(t *testing.T) {
+		t.Parallel()
+
+		w := &closeCountingWriter{closeErr: closeErr}
+		err := ReceivePack(context.Background(), seedRef(t, ref, hash),
+			receivePackRequest(t, []*packp.Command{deleteCmd(ref, hash)}),
+			w, &ReceivePackRequest{StatelessRPC: true})
+
+		require.ErrorIs(t, err, closeErr)
+		assert.Contains(t, err.Error(), "closing writer")
+		assert.Contains(t, w.buf.String(), "ok refs/heads/main")
+	})
+
+	t.Run("yields to a refused refname", func(t *testing.T) {
+		t.Parallel()
+
+		w := &closeCountingWriter{closeErr: closeErr}
+		err := ReceivePack(context.Background(), seedRef(t, ref, hash),
+			receivePackRequest(t, []*packp.Command{
+				{Name: plumbing.HEAD, Old: plumbing.ZeroHash, New: hash},
+			}),
+			w, &ReceivePackRequest{StatelessRPC: true})
+
+		require.ErrorIs(t, err, ErrFunnyRefname)
+		assert.NotErrorIs(t, err, closeErr)
+		assert.Equal(t, 1, w.closes)
+	})
+}
+
+// TestReceivePackReportsStatusInCommandOrder pins the order of the report, not
+// just its contents: git emits one status line per command in the order the
+// commands arrived, and a client pairing them up positionally depends on that.
+// The statuses are collected in a map, so the lines have to be driven off the
+// command list to come out in a stable order at all.
+func TestReceivePackReportsStatusInCommandOrder(t *testing.T) {
+	t.Parallel()
+
+	hash := plumbing.NewHash(receivePackTestHash)
+	st := memory.NewStorage()
+
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: "refs/heads/one", Old: plumbing.ZeroHash, New: hash},
+			{Name: "CONFIG", Old: plumbing.ZeroHash, New: hash},
+			{Name: "refs/heads/two", Old: plumbing.ZeroHash, New: hash},
+			{Name: "refs/heads/three", Old: plumbing.ZeroHash, New: hash},
+			{Name: "HEAD", Old: plumbing.ZeroHash, New: hash},
+		}),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{StatelessRPC: true},
+	)
+	require.ErrorIs(t, err, ErrFunnyRefname)
+
+	assert.Equal(t, "000eunpack ok\n"+
+		"0016ok refs/heads/one\n"+
+		"001cng CONFIG funny refname\n"+
+		"0016ok refs/heads/two\n"+
+		"0018ok refs/heads/three\n"+
+		"001ang HEAD funny refname\n"+
+		"0000", out.String())
+}
+
+// TestReceivePackUnpackFailure covers the exit taken when the packfile does not
+// decode, which is the one failure exit with no test of its own. It has to
+// behave like the other two: report the reason to the client, terminate the
+// sideband stream, and hand the caller the error rather than a nil that reads
+// as a clean push.
+func TestReceivePackUnpackFailure(t *testing.T) {
+	t.Parallel()
+
+	hash := plumbing.NewHash(receivePackTestHash)
+	cmds := []*packp.Command{
+		{Name: "refs/heads/main", Old: plumbing.ZeroHash, New: hash},
+	}
+	badPack := []byte("this is not a packfile")
+
+	t.Run("plain", func(t *testing.T) {
+		t.Parallel()
+
+		st := memory.NewStorage()
+
+		var out bytes.Buffer
+		err := ReceivePack(
+			context.Background(), st,
+			receivePackBody(t, cmds, badPack),
+			ioutil.WriteNopCloser(&out),
+			&ReceivePackRequest{StatelessRPC: true},
+		)
+		require.Error(t, err)
+
+		// The unpack line carries the reason, and no command is reported at
+		// all: nothing was attempted, so there is no per-ref outcome to give.
+		assert.Contains(t, out.String(), "unpack ")
+		assert.NotContains(t, out.String(), "refs/heads/main")
+		assert.Contains(t, out.String(), err.Error(),
+			"the error handed back must be the one reported to the client")
+
+		_, refErr := st.Reference("refs/heads/main")
+		assert.ErrorIs(t, refErr, plumbing.ErrReferenceNotFound)
+	})
+
+	t.Run("sideband", func(t *testing.T) {
+		t.Parallel()
+
+		var out bytes.Buffer
+		err := ReceivePack(
+			context.Background(), memory.NewStorage(),
+			receivePackBody(t, cmds, badPack, capability.Sideband64k),
+			ioutil.WriteNopCloser(&out),
+			&ReceivePackRequest{StatelessRPC: true},
+		)
+		require.Error(t, err)
+
+		// ReportStatus.Encode ends with a flush, but on this path that flush is
+		// muxed into band 1 like the rest of the report. The byte stream needs
+		// a bare flush after it, or the client is left demuxing a sideband
+		// stream with no terminator.
+		assert.True(t, strings.HasSuffix(out.String(), "\x0100000000"),
+			"sideband stream must end with a muxed flush then a bare one, got %q", out.String())
+
+		demuxed := readSideband(t, &out)
+		assert.Contains(t, demuxed.data.String(), "unpack ")
+	})
 }

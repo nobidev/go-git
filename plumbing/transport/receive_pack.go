@@ -86,12 +86,27 @@ func ReceivePack(
 	r io.ReadCloser,
 	w io.WriteCloser,
 	opts *ReceivePackRequest,
-) error {
+) (err error) {
 	if w == nil {
 		return fmt.Errorf("nil writer")
 	}
 
 	w = ioutil.NewContextWriteCloser(ctx, w)
+
+	// Every exit from here on closes the writer, because the close is what ends
+	// the response for the caller's transport: a return that skips it leaves a
+	// client waiting on a stream that will never end. That holds for the early
+	// returns too, where nothing has been written yet, and for a refused ref,
+	// where the "ng <ref> <reason>" line is the response.
+	//
+	// The close error only surfaces when nothing else went wrong: a rejected
+	// command or a malformed request describes the exchange better than a
+	// failure to hang up does.
+	defer func() {
+		if closeErr := closeWriter(w); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	if opts == nil {
 		opts = &ReceivePackRequest{}
@@ -197,10 +212,37 @@ func ReceivePack(
 	}
 
 	writeCloser := ioutil.NewWriteCloser(writer, w)
+
+	// report is how every remaining exit answers the client: the report-status,
+	// then the flush that ends the sideband stream when one is in use.
+	// ReportStatus.Encode writes a flush of its own, but on a sideband exchange
+	// that one is muxed into band 1 along with the rest of the report, so it
+	// does not terminate the stream the client is demuxing. Routing all three
+	// exits through one function is what stops one of them from answering
+	// without that second flush.
+	report := func(unpackErr error, cmdStatus map[plumbing.ReferenceName]error) error {
+		if err := sendReportStatus(writeCloser, updreq.Commands, unpackErr, cmdStatus); err != nil {
+			return err
+		}
+		if !useSideband {
+			return nil
+		}
+		if err := pktline.WriteFlush(w); err != nil {
+			return fmt.Errorf("flushing sideband: %w", err)
+		}
+		return nil
+	}
+
 	if unpackErr != nil {
-		res := sendReportStatus(writeCloser, unpackErr, nil)
-		_ = closeWriter(w)
-		return res
+		// No command was attempted, so there is no per-ref outcome to give and
+		// the unpack line carries the whole reason. The error still goes back
+		// to the caller: writing the report successfully does not turn a failed
+		// push into a successful exchange, and the two failure exits below
+		// answer the same way.
+		if err := report(unpackErr, nil); err != nil {
+			return err
+		}
+		return unpackErr
 	}
 
 	if opts.Hooks.PreReceive != nil {
@@ -215,17 +257,7 @@ func ReceivePack(
 			for _, cmd := range updreq.Commands {
 				rejected[cmd.Name] = hookErr
 			}
-			if err := sendReportStatus(writeCloser, nil, rejected); err != nil {
-				_ = closeWriter(w)
-				return err
-			}
-			if useSideband {
-				if err := pktline.WriteFlush(w); err != nil {
-					_ = closeWriter(w)
-					return fmt.Errorf("flushing sideband: %w", err)
-				}
-			}
-			if err := closeWriter(w); err != nil {
+			if err := report(nil, rejected); err != nil {
 				return err
 			}
 			return hookErr
@@ -257,22 +289,7 @@ func ReceivePack(
 	// carried by cmdStatus as "ng <ref> <reason>" lines, exactly as the
 	// PreReceive rejection path does; folding firstErr into the unpack status
 	// would make a client treat a single refused ref as a corrupt push.
-	if err := sendReportStatus(writeCloser, nil, cmdStatus); err != nil {
-		return err
-	}
-
-	if useSideband {
-		if err := pktline.WriteFlush(w); err != nil {
-			_ = closeWriter(w)
-			return fmt.Errorf("flushing sideband: %w", err)
-		}
-	}
-
-	// The writer is closed even when a ref was refused: firstErr describes one
-	// command, while the close is what ends the response for the caller's
-	// transport. Skipping it leaves a client waiting on a stream that will
-	// never end.
-	if err := closeWriter(w); err != nil && firstErr == nil {
+	if err := report(nil, cmdStatus); err != nil {
 		return err
 	}
 
@@ -292,20 +309,39 @@ func closeWriter(w io.WriteCloser) error {
 	return nil
 }
 
-func sendReportStatus(w io.WriteCloser, unpackErr error, cmdStatus map[plumbing.ReferenceName]error) error {
+// sendReportStatus writes the report-status for the exchange: the unpack line,
+// then one status line per command.
+//
+// The lines follow cmds, not the cmdStatus map. Git reports in the order the
+// commands arrived and a client is entitled to pair the two up positionally,
+// whereas ranging over the map orders them differently on every push. A command
+// with no entry in cmdStatus was never attempted and is not reported; a name
+// repeated across commands is reported once, because the map holds one outcome
+// for it.
+func sendReportStatus(w io.WriteCloser, cmds []*packp.Command, unpackErr error, cmdStatus map[plumbing.ReferenceName]error) error {
 	rs := &packp.ReportStatus{}
 	rs.UnpackStatus = "ok"
 	if unpackErr != nil {
 		rs.UnpackStatus = unpackErr.Error()
 	}
 
-	for ref, err := range cmdStatus {
+	reported := make(map[plumbing.ReferenceName]struct{}, len(cmdStatus))
+	for _, cmd := range cmds {
+		err, ok := cmdStatus[cmd.Name]
+		if !ok {
+			continue
+		}
+		if _, done := reported[cmd.Name]; done {
+			continue
+		}
+		reported[cmd.Name] = struct{}{}
+
 		msg := "ok"
 		if err != nil {
 			msg = err.Error()
 		}
 		status := &packp.CommandStatus{
-			ReferenceName: ref,
+			ReferenceName: cmd.Name,
 			Status:        msg,
 		}
 		rs.CommandStatuses = append(rs.CommandStatuses, status)
