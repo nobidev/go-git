@@ -231,6 +231,9 @@ func TestReceivePackPostReceivePartialSuccess(t *testing.T) {
 	require.Len(t, info.Commands, 1, "PostReceive must only see refs that applied")
 	assert.Equal(t, good, info.Commands[0].Name)
 
+	// A refused ref is reported per-command; the unpack status describes the
+	// packfile only and must stay "ok".
+	assert.Contains(t, out.String(), "unpack ok")
 	assert.Contains(t, out.String(), "ok refs/heads/good")
 	assert.Contains(t, out.String(), "ng refs/heads/bad")
 }

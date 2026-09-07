@@ -250,19 +250,31 @@ func ReceivePack(
 		_ = opts.Hooks.PostReceive(ctx, info)
 	}
 
-	if err := sendReportStatus(writeCloser, firstErr, cmdStatus); err != nil {
+	// The unpack status reports on the packfile, not on the ref updates: it is
+	// "ok" here because unpackErr was handled above. Per-command failures are
+	// carried by cmdStatus as "ng <ref> <reason>" lines, exactly as the
+	// PreReceive rejection path does; folding firstErr into the unpack status
+	// would make a client treat a single refused ref as a corrupt push.
+	if err := sendReportStatus(writeCloser, nil, cmdStatus); err != nil {
 		return err
 	}
 
 	if useSideband {
 		if err := pktline.WriteFlush(w); err != nil {
+			_ = closeWriter(w)
 			return fmt.Errorf("flushing sideband: %w", err)
 		}
 	}
-	if firstErr != nil {
-		return firstErr
+
+	// The writer is closed even when a ref was refused: firstErr describes one
+	// command, while the close is what ends the response for the caller's
+	// transport. Skipping it leaves a client waiting on a stream that will
+	// never end.
+	if err := closeWriter(w); err != nil && firstErr == nil {
+		return err
 	}
-	return closeWriter(w)
+
+	return firstErr
 }
 
 type sidebandProgress struct{ mux *sideband.Muxer }
