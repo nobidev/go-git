@@ -147,6 +147,39 @@ func (s *SuiteDotGit) TestReferenceNameRejectsHFSDisguisedTraversal() {
 	s.Error(err, "traversal must not create .git/config")
 }
 
+func (s *SuiteDotGit) TestReferenceNameRejectsDisguisedSelfReference() {
+	d := New(s.EmptyFS())
+	s.Require().NoError(d.Initialize())
+
+	// A component that folds to a single "." names the directory it sits in,
+	// so each of these resolves to refs/heads/main once joined: HFS+ drops the
+	// ignorable code points, and NTFS trims the trailing space or truncates at
+	// the Alternate Data Stream colon. IsSafe compares components literally and
+	// this layer never runs Validate, so nothing else here stops them.
+	for _, n := range []plumbing.ReferenceName{
+		"refs/heads/\u200c./main",
+		"refs/heads/.\u200c/main",
+		"refs/\u200c./heads/main",
+		"refs/heads/. /main",
+		"refs/heads/.:$DATA/main",
+	} {
+		ref := plumbing.NewHashReference(n, plumbing.NewHash("e8d3ffab552895c19b9fcf7aa264d277cde33881"))
+		s.ErrorIs(d.SetRef(ref, nil), ErrReferenceNameEscape, "SetRef %q", n)
+
+		_, err := d.Ref(n)
+		s.ErrorIs(err, ErrReferenceNameEscape, "Ref %q", n)
+
+		s.ErrorIs(d.RemoveRef(n), ErrReferenceNameEscape, "RemoveRef %q", n)
+	}
+
+	// The aliasing itself only happens on HFS+ or NTFS, so what this asserts
+	// on any host is that the name never became a path: nothing was stored
+	// under refs/heads at all.
+	entries, err := d.fs.ReadDir(d.fs.Join(refsPath, "heads"))
+	s.NoError(err)
+	s.Empty(entries)
+}
+
 func (s *SuiteDotGit) TestReferenceNameRejectsAbsoluteAndDriveNames() {
 	d := New(s.EmptyFS())
 	s.Require().NoError(d.Initialize())
@@ -176,20 +209,35 @@ func (s *SuiteDotGit) TestReferenceNameRejectsTopLevelMetadata() {
 	d := New(s.EmptyFS())
 	s.Require().NoError(d.Initialize())
 
-	// A single-level name that is neither under refs/ nor a [A-Z_] pseudo-ref
-	// would land on top-level .git metadata once joined; the IsSafe gate
-	// rejects it, matching upstream refname_is_safe.
+	// A single-level name that is neither under refs/ nor a root ref would
+	// land on top-level .git metadata once joined. The lowercase spellings are
+	// stopped by IsSafe; the uppercase ones are not (refname_is_safe accepts
+	// any [A-Z_] one-level name) and are stopped by the root-ref allowlist —
+	// they matter because a case-insensitive filesystem folds "CONFIG" onto
+	// .git/config.
 	bad := []plumbing.ReferenceName{
 		"config", "config.worktree", "index", "packed-refs",
 		"shallow", "hooks", "objects", "bar", "HEAD2", "head",
+		"CONFIG", "INDEX", "SHALLOW", "DESCRIPTION", "COMMONDIR",
+		"GITDIR", "LOGS", "MODULES", "BRANCHES", "REMOTES", "HOOKS",
+		"INFO", "OBJECTS", "REFS", "WORKTREES", "PACKED_REFS",
+		"COMMIT_EDITMSG", "MERGE_MSG",
+		// A '-' satisfies is_root_ref_syntax, so IsRoot alone would let this
+		// through; IsSafe running first is what stops it.
+		"SOME-THING_HEAD",
 	}
 	for _, n := range bad {
 		ref := plumbing.NewHashReference(n, plumbing.NewHash("e8d3ffab552895c19b9fcf7aa264d277cde33881"))
 		s.ErrorIs(d.SetRef(ref, nil), ErrReferenceNameEscape, "SetRef %q", n)
+		s.ErrorIs(d.RemoveRef(n), ErrReferenceNameEscape, "RemoveRef %q", n)
+		_, err := d.Ref(n)
+		s.ErrorIs(err, ErrReferenceNameEscape, "Ref %q", n)
 	}
 
-	_, err := d.fs.Stat(configPath)
-	s.Error(err, "must not create .git/config")
+	for _, p := range []string{configPath, indexPath, shallowPath, packedRefsPath} {
+		_, err := d.fs.Stat(p)
+		s.Error(err, "must not create .git/%s", p)
+	}
 }
 
 func (s *SuiteDotGit) TestReferenceNameAcceptsBenignNames() {
@@ -197,11 +245,19 @@ func (s *SuiteDotGit) TestReferenceNameAcceptsBenignNames() {
 	s.Require().NoError(d.Initialize())
 	for _, n := range []plumbing.ReferenceName{
 		"HEAD", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+		"AUTO_MERGE", "MERGE_AUTOSTASH", "BISECT_EXPECTED_REV",
+		"NOTES_MERGE_REF", "NOTES_MERGE_PARTIAL",
 		"refs/heads/main", "refs/heads/release-1.2",
 		"refs/tags/v1.0.0", "refs/remotes/origin/HEAD", "refs/stash",
 	} {
 		ref := plumbing.NewHashReference(n, plumbing.NewHash("e8d3ffab552895c19b9fcf7aa264d277cde33881"))
 		s.Require().NoError(d.SetRef(ref, nil), "SetRef %q", n)
+
+		got, err := d.Ref(n)
+		s.Require().NoError(err, "Ref %q", n)
+		s.Equal(n, got.Name(), "Ref %q", n)
+
+		s.Require().NoError(d.RemoveRef(n), "RemoveRef %q", n)
 	}
 }
 

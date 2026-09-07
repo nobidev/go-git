@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"errors"
 	"io"
 	"testing"
@@ -22,9 +23,10 @@ import (
 const receivePackTestHash = "0123456789012345678901234567890123456789"
 
 // receivePackRequest builds a wire-format receive-pack body for the given
-// commands, with ReportStatus advertised plus any extra caps. Tests use
-// Delete-only commands so no packfile follows, which keeps focus on hook
-// plumbing rather than pack handling.
+// commands, with ReportStatus advertised plus any extra caps. A packfile
+// follows unless every command is a Delete, because receive-pack expects one
+// there; the pack is empty so that these tests stay on ref handling rather than
+// pack decoding.
 func receivePackRequest(t *testing.T, cmds []*packp.Command, extra ...capability.Capability) io.ReadCloser {
 	t.Helper()
 
@@ -41,6 +43,19 @@ func receivePackRequest(t *testing.T, cmds []*packp.Command, extra ...capability
 
 	var buf bytes.Buffer
 	require.NoError(t, req.Encode(&buf))
+
+	for _, cmd := range cmds {
+		if cmd.Action() != packp.Delete {
+			// A zero-object packfile: the "PACK" signature, version 2 and an
+			// object count of 0, followed by the SHA-1 of those twelve bytes.
+			header := []byte("PACK\x00\x00\x00\x02\x00\x00\x00\x00")
+			sum := sha1.Sum(header)
+			buf.Write(header)
+			buf.Write(sum[:])
+			break
+		}
+	}
+
 	return io.NopCloser(&buf)
 }
 
@@ -281,4 +296,291 @@ func readSideband(t *testing.T, r io.Reader) sidebandPayload {
 	_, err := io.Copy(&p.data, demux)
 	require.NoError(t, err)
 	return p
+}
+
+// funnyNames are refnames receive-pack must refuse whatever storer sits behind
+// it: upstream's builtin/receive-pack.c reports "funny refname" for a command
+// whose name is not under refs/ or fails its format check. Every test here
+// drives ReceivePack against memory.NewStorage(), so a refusal can only come
+// from the transport gate — the dotgit layer's own checks are not in the way.
+var funnyNames = []plumbing.ReferenceName{
+	// Root refs and top-level metadata: not under refs/ at all.
+	"HEAD",
+	"CONFIG",
+	"config",
+	"INDEX",
+	"SHALLOW",
+	"ORIG_HEAD",
+	// Escapes from the refs/ sub-tree, spelled literally...
+	"refs/../CONFIG",
+	"refs/heads/../../config",
+	// ...and disguised with the code points HFS+ drops during path
+	// normalisation. Each component below is a ".." to the filesystem while
+	// holding no literal "..", which is exactly what carries it past IsSafe
+	// (a literal comparison) and Validate (rule 3, "contains ..").
+	// ZERO WIDTH NON-JOINER around the dots:
+	"refs/\u200c.\u200c./CONFIG",
+	"refs/heads/\u200c.\u200c./\u200c.\u200c./config",
+	// ZERO WIDTH NO-BREAK SPACE (the UTF-8 BOM):
+	"refs/\ufeff.\ufeff.\ufeff/CONFIG",
+	// LEFT-TO-RIGHT MARK:
+	"refs/\u200e.\u200e./config",
+	// A component the filesystem reads as a single "." aliases the directory
+	// it sits in, so each of these names resolves to a ref one level up while
+	// holding no literal "." component. The leading-ignorable spellings pass
+	// every other gate: IsSafe compares literally, and Validate's rule 1 sees
+	// a component starting with a code point rather than a dot.
+	"refs/\u200c./heads/main",
+	"refs/heads/\u200c./main",
+	"refs/heads/\u200c.\u200c/main",
+	"refs/\ufeff./heads/main",
+	"refs/heads/.:$DATA/main",
+	// The trailing-space spellings NTFS also folds ("refs/heads/. /main") are
+	// absent because they cannot arrive here: a pkt-line command is
+	// space-separated, so the name is truncated at the space during decoding
+	// and never reaches the gate whole. pathutil and the dotgit storer cover
+	// them, where a name arrives as a Go string rather than off the wire.
+	// Malformed by check_refname_format.
+	"refs/",
+	"refs/heads/foo..bar",
+	"refs/heads/foo.lock",
+	"refs/heads/foo\\bar",
+	// Knowingly stricter than upstream: real git accepts both of these on
+	// push, but ReferenceName.Validate refuses a third component starting with
+	// "-" and a component spelled "@", and this gate reuses Validate. Pinned so
+	// the divergence stays a decision on record rather than a surprise.
+	"refs/heads/-foo",
+	"refs/heads/@",
+}
+
+func TestReceivePackRefusesFunnyRefnameCreate(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range funnyNames {
+		t.Run(name.String(), func(t *testing.T) {
+			t.Parallel()
+
+			st := memory.NewStorage()
+			hash := plumbing.NewHash(receivePackTestHash)
+
+			var out bytes.Buffer
+			err := ReceivePack(
+				context.Background(),
+				st,
+				receivePackRequest(t, []*packp.Command{
+					{Name: name, Old: plumbing.ZeroHash, New: hash},
+				}),
+				ioutil.WriteNopCloser(&out),
+				&ReceivePackRequest{StatelessRPC: true},
+			)
+			require.ErrorIs(t, err, ErrFunnyRefname)
+
+			assert.Contains(t, out.String(), "unpack ok")
+			assert.Contains(t, out.String(), "ng "+name.String()+" funny refname")
+
+			_, refErr := st.Reference(name)
+			assert.ErrorIs(t, refErr, plumbing.ErrReferenceNotFound,
+				"%q must not be created", name)
+		})
+	}
+}
+
+func TestReceivePackRefusesFunnyRefnameUpdate(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range funnyNames {
+		t.Run(name.String(), func(t *testing.T) {
+			t.Parallel()
+
+			old := plumbing.NewHash("1111111111111111111111111111111111111111")
+			st := seedRef(t, name, old)
+
+			var out bytes.Buffer
+			err := ReceivePack(
+				context.Background(),
+				st,
+				receivePackRequest(t, []*packp.Command{
+					{Name: name, Old: old, New: plumbing.NewHash(receivePackTestHash)},
+				}),
+				ioutil.WriteNopCloser(&out),
+				&ReceivePackRequest{StatelessRPC: true},
+			)
+			require.ErrorIs(t, err, ErrFunnyRefname)
+
+			assert.Contains(t, out.String(), "ng "+name.String()+" funny refname")
+
+			got, refErr := st.Reference(name)
+			require.NoError(t, refErr)
+			assert.Equal(t, old, got.Hash(), "%q must not move", name)
+		})
+	}
+}
+
+func TestReceivePackRefusesFunnyRefnameDelete(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range funnyNames {
+		t.Run(name.String(), func(t *testing.T) {
+			t.Parallel()
+
+			hash := plumbing.NewHash(receivePackTestHash)
+			st := seedRef(t, name, hash)
+
+			var out bytes.Buffer
+			err := ReceivePack(
+				context.Background(),
+				st,
+				receivePackRequest(t, []*packp.Command{deleteCmd(name, hash)}),
+				ioutil.WriteNopCloser(&out),
+				&ReceivePackRequest{StatelessRPC: true},
+			)
+			require.ErrorIs(t, err, ErrFunnyRefname)
+
+			assert.Contains(t, out.String(), "ng "+name.String()+" funny refname")
+
+			_, refErr := st.Reference(name)
+			assert.NoError(t, refErr, "%q must not be deleted", name)
+		})
+	}
+}
+
+func TestReceivePackFunnyRefnameDoesNotBlockGoodRefs(t *testing.T) {
+	t.Parallel()
+
+	good := plumbing.ReferenceName("refs/heads/ok")
+	hash := plumbing.NewHash(receivePackTestHash)
+	st := memory.NewStorage()
+
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: "CONFIG", Old: plumbing.ZeroHash, New: hash},
+			{Name: good, Old: plumbing.ZeroHash, New: hash},
+		}),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{StatelessRPC: true},
+	)
+	require.ErrorIs(t, err, ErrFunnyRefname)
+
+	assert.Contains(t, out.String(), "ng CONFIG funny refname")
+	assert.Contains(t, out.String(), "ok refs/heads/ok")
+
+	ref, refErr := st.Reference(good)
+	require.NoError(t, refErr)
+	assert.Equal(t, hash, ref.Hash())
+}
+
+func TestReceivePackFunnyRefnameReportsOnSideband(t *testing.T) {
+	t.Parallel()
+
+	st := memory.NewStorage()
+
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: "CONFIG", Old: plumbing.ZeroHash, New: plumbing.NewHash(receivePackTestHash)},
+		}, capability.Sideband64k),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{StatelessRPC: true},
+	)
+	require.ErrorIs(t, err, ErrFunnyRefname)
+
+	demuxed := readSideband(t, &out)
+	assert.Contains(t, demuxed.data.String(), "unpack ok")
+	assert.Contains(t, demuxed.data.String(), "ng CONFIG funny refname")
+}
+
+// TestReceivePackFunnyRefnameWireFormat pins the bytes rather than the error,
+// because the report-status wire format is what a real git client parses: the
+// unpack line stays "ok" (the packfile was fine, one command was not), the
+// refusal is a single "ng" line carrying ErrFunnyRefname's message verbatim,
+// and the report ends with a flush.
+func TestReceivePackFunnyRefnameWireFormat(t *testing.T) {
+	t.Parallel()
+
+	st := memory.NewStorage()
+
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: "CONFIG", Old: plumbing.ZeroHash, New: plumbing.NewHash(receivePackTestHash)},
+		}),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{StatelessRPC: true},
+	)
+	require.ErrorIs(t, err, ErrFunnyRefname)
+
+	assert.Equal(t, "000eunpack ok\n001cng CONFIG funny refname\n0000", out.String())
+}
+
+func TestReceivePackAcceptsWellFormedRefs(t *testing.T) {
+	t.Parallel()
+
+	hash := plumbing.NewHash(receivePackTestHash)
+	other := plumbing.NewHash("1111111111111111111111111111111111111111")
+
+	for _, name := range []plumbing.ReferenceName{
+		"refs/heads/main",
+		"refs/heads/feature/nested/name",
+		"refs/heads/release-1.2",
+		"refs/tags/v1.0.0",
+		"refs/stash",
+		"refs/remotes/origin/HEAD",
+		// Namespaces outside refs/heads and refs/tags that tools push to, all
+		// accepted by upstream git's receive-pack.
+		"refs/notes/commits",
+		"refs/replace/deadbeef",
+		"refs/meta/config",
+		"refs/for/main",
+		"refs/pull/1/head",
+		"refs/keep-around/abc123",
+	} {
+		t.Run(name.String(), func(t *testing.T) {
+			t.Parallel()
+
+			st := memory.NewStorage()
+
+			var out bytes.Buffer
+			require.NoError(t, ReceivePack(
+				context.Background(), st,
+				receivePackRequest(t, []*packp.Command{
+					{Name: name, Old: plumbing.ZeroHash, New: other},
+				}),
+				ioutil.WriteNopCloser(&out),
+				&ReceivePackRequest{StatelessRPC: true},
+			))
+			assert.Contains(t, out.String(), "ok "+name.String())
+
+			out.Reset()
+			require.NoError(t, ReceivePack(
+				context.Background(), st,
+				receivePackRequest(t, []*packp.Command{
+					{Name: name, Old: other, New: hash},
+				}),
+				ioutil.WriteNopCloser(&out),
+				&ReceivePackRequest{StatelessRPC: true},
+			))
+			assert.Contains(t, out.String(), "ok "+name.String())
+			ref, refErr := st.Reference(name)
+			require.NoError(t, refErr)
+			assert.Equal(t, hash, ref.Hash())
+
+			out.Reset()
+			require.NoError(t, ReceivePack(
+				context.Background(), st,
+				receivePackRequest(t, []*packp.Command{deleteCmd(name, hash)}),
+				ioutil.WriteNopCloser(&out),
+				&ReceivePackRequest{StatelessRPC: true},
+			))
+			assert.Contains(t, out.String(), "ok "+name.String())
+			_, refErr = st.Reference(name)
+			assert.ErrorIs(t, refErr, plumbing.ErrReferenceNotFound)
+		})
+	}
 }

@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
+	"github.com/go-git/go-git/v6/internal/pathutil"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 	"github.com/go-git/go-git/v6/plumbing/format/pktline"
@@ -332,8 +334,85 @@ func referenceExists(s storer.ReferenceStorer, n plumbing.ReferenceName) (bool, 
 	return err == nil, err
 }
 
+// refsPrefix is the only sub-tree receive-pack will write to.
+const refsPrefix = "refs/"
+
+// checkRefname returns [ErrFunnyRefname] if receive-pack must refuse a command
+// naming ref, and nil if the name may reach the storer.
+//
+// It mirrors the gate in Git's builtin/receive-pack.c (execute_commands_non_atomic
+// -> update, "only refs/... are allowed"), which refuses a command whose name
+// is not under refs/ or fails check_refname_format, reporting "funny refname".
+// Without it, a push can name HEAD, CONFIG, INDEX or SHALLOW and reach the
+// storer: writing HEAD repoints the repository's default branch for every
+// later clone on any filesystem, and on a case-insensitive one the shouting
+// names land on .git/config, .git/index and .git/shallow. A Delete command
+// needs no packfile at all, so the same names also give an unauthenticated
+// "remove .git/config" primitive.
+//
+// The name is checked in four steps, each of which alone is insufficient:
+//
+//   - the refs/ prefix, which is what stops HEAD and every other root ref.
+//     Git relaxes its format check for deletes (REFNAME_ALLOW_ONELEVEL) but
+//     never relaxes this prefix, and neither do we: deleting a ref is the
+//     cheapest form of this attack, not the most benign.
+//   - ReferenceName.IsSafe, Git's refname_is_safe, for names that escape the
+//     refs/ sub-tree or alias another path once joined.
+//   - pathutil.HasUnsafeComponent, for the escapes IsSafe's literal ".."
+//     comparison misses: control characters, and the components an HFS+ or
+//     NTFS filesystem folds back to "." or "..". The dotgit storage layer
+//     applies the same helper, but this gate cannot lean on it: ReceivePack is
+//     exported and can be handed any storer, including one that never reaches
+//     a filesystem.
+//   - ReferenceName.Validate, go-git's check_refname_format, for the remaining
+//     character and component rules.
+//
+// Two divergences from upstream are deliberate:
+//
+//   - Git runs check_refname_format on the part after "refs/" and passes
+//     REFNAME_ALLOW_ONELEVEL only for deletes, so it refuses to *create*
+//     refs/stash ("funny refname") while allowing it to be deleted. go-git
+//     validates the whole name, which accepts one level under refs/ for every
+//     action. refs/stash is a first-class ref here, and a single component
+//     under refs/ cannot escape the sub-tree, so the asymmetry would cost
+//     compatibility and buy no safety.
+//   - Validate is stricter than check_refname_format in two spots: it refuses a
+//     third component starting with "-" (refs/heads/-foo, refs/tags/-v1) and a
+//     component spelled exactly "@" (refs/heads/@), both of which real git
+//     accepts on push. Those names are refused here as a consequence of reusing
+//     Validate, not as a judgement of this gate; relaxing Validate changes
+//     exported behaviour and belongs in its own change.
+//
+// The error is returned bare on purpose: sendReportStatus writes Error()
+// verbatim into the "ng <ref> <reason>" line, so wrapping it with extra context
+// would hand the client a status git never sends.
+func checkRefname(ref plumbing.ReferenceName) error {
+	if !strings.HasPrefix(ref.String(), refsPrefix) {
+		return ErrFunnyRefname
+	}
+
+	if !ref.IsSafe() {
+		return ErrFunnyRefname
+	}
+
+	if pathutil.HasUnsafeComponent(ref.String()) {
+		return ErrFunnyRefname
+	}
+
+	if err := ref.Validate(); err != nil {
+		return ErrFunnyRefname
+	}
+
+	return nil
+}
+
 func updateReferences(st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
 	for _, cmd := range req.Commands {
+		if err := checkRefname(cmd.Name); err != nil {
+			setStatus(cmdStatus, firstErr, cmd.Name, err)
+			continue
+		}
+
 		exists, err := referenceExists(st, cmd.Name)
 		if err != nil {
 			setStatus(cmdStatus, firstErr, cmd.Name, err)

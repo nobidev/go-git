@@ -19,6 +19,10 @@ import (
 // ErrUpdateReference is returned when a reference update fails.
 var ErrUpdateReference = errors.New("failed to update ref")
 
+// ErrFunnyRefname is returned when a push names a reference the server refuses
+// to touch: one that is not under refs/, or one whose name is malformed.
+var ErrFunnyRefname = errors.New("funny refname")
+
 // AdvertiseRefs is a server command that implements the reference
 // discovery phase of the v0/v1 Git transfer protocol. Protocol v2 advertises
 // capabilities only, via [AdvertiseCapabilities]; the sole reason this function

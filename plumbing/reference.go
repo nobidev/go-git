@@ -127,14 +127,19 @@ func (r ReferenceName) IsPeeled() bool {
 //   - under "refs/", non-empty after the prefix, containing no backslash and
 //     no empty, "." or ".." path component (so it cannot escape the refs/
 //     sub-tree, or alias another name, once turned into a path); or
-//   - a one-level pseudo-ref whose spelling is restricted to [A-Z_]
+//   - a one-level name whose spelling is restricted to [A-Z_]
 //     (e.g. HEAD, ORIG_HEAD, FETCH_HEAD).
 //
 // Everything else — a lowercase or mixed one-level name such as "config" or
 // "index", an absolute or drive-prefixed name, or a refs/ name that escapes —
-// is unsafe, because it could resolve onto unrelated repository metadata.
-// This is a storage-safety check, not full check_refname_format validation;
-// see Validate for the latter.
+// is unsafe.
+//
+// IsSafe is not an allowlist of legitimate names, and does not on its own keep
+// a name off unrelated repository metadata: its one-level arm admits any [A-Z_]
+// spelling, "CONFIG" and "SHALLOW" included. A caller that creates or updates a
+// reference must also require the name to be under refs/ or to satisfy IsRoot.
+// This is a storage-safety check, not full check_refname_format validation; see
+// Validate for the latter.
 func (r ReferenceName) IsSafe() bool {
 	s := string(r)
 	if s == "" {
@@ -156,12 +161,67 @@ func (r ReferenceName) IsSafe() bool {
 		return true
 	}
 
+	// Git's refname_is_safe only decides whether deleting a loose ref by this
+	// name can do damage, so its [A-Z_] arm admits any shouting spelling.
+	// "CONFIG" and "SHALLOW" fold onto .git/config and .git/shallow on a
+	// case-insensitive filesystem; IsRoot is what tells the genuine root refs
+	// apart from those.
 	for i := 0; i < len(s); i++ {
 		if (s[i] < 'A' || s[i] > 'Z') && s[i] != '_' {
 			return false
 		}
 	}
 	return true
+}
+
+// IsRoot reports whether the reference name is one of the one-level references
+// that legitimately live in the root of the reference store, next to refs/.
+// It mirrors Git's is_root_ref (refs.c): the name must be spelled with
+// [A-Z_-] only and must either end in "_HEAD" (ORIG_HEAD, FETCH_HEAD,
+// MERGE_HEAD, CHERRY_PICK_HEAD, REBASE_HEAD, ...) or be one of the irregular
+// names Git lists explicitly (HEAD, AUTO_MERGE, BISECT_EXPECTED_REV,
+// NOTES_MERGE_PARTIAL, NOTES_MERGE_REF, MERGE_AUTOSTASH). Unlike Git's
+// is_root_ref, FETCH_HEAD and MERGE_HEAD are included.
+//
+// IsRoot reports false for every name under refs/, and is not a complete test
+// on its own: its alphabet admits '-', so "SOME-THING_HEAD" satisfies IsRoot
+// while IsSafe rejects it. Test IsSafe first, then accept the name if it is
+// under refs/ or satisfies IsRoot.
+func (r ReferenceName) IsRoot() bool {
+	// An allowlist by design: denying the names of known .git entries instead
+	// would be incomplete the moment Git adds a file, whereas the set of
+	// legitimate root refs changes only when Git grows a new one.
+	//
+	// FETCH_HEAD and MERGE_HEAD are kept because Git excludes them only via
+	// is_pseudo_ref, which marks the names its ref transactions refuse to
+	// update since they carry more than an object id. That is a write-policy
+	// rule rather than a naming rule, and go-git writes both through the
+	// ordinary path.
+	s := string(r)
+	if s == "" {
+		return false
+	}
+
+	// is_root_ref_syntax: uppercase, '-' and '_' only.
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < 'A' || c > 'Z') && c != '_' && c != '-' {
+			return false
+		}
+	}
+
+	if strings.HasSuffix(s, "_HEAD") {
+		return true
+	}
+
+	// The one-level names is_root_ref accepts by exact spelling, i.e. those
+	// that do not match its "*_HEAD" suffix rule.
+	switch r {
+	case "HEAD", "AUTO_MERGE", "BISECT_EXPECTED_REV",
+		"NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF", "MERGE_AUTOSTASH":
+		return true
+	}
+
+	return false
 }
 
 func (r ReferenceName) String() string {

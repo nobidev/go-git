@@ -46,6 +46,7 @@ const (
 	objectsPath        = "objects"
 	packPath           = "pack"
 	refsPath           = "refs"
+	refsPrefix         = refsPath + "/"
 	branchesPath       = "branches"
 	hooksPath          = "hooks"
 	infoPath           = "info"
@@ -102,43 +103,50 @@ var (
 	ErrReferenceNameEscape = errors.New("reference name escapes the reference storage")
 )
 
-func isPathSep(r rune) bool { return r == '/' || r == '\\' }
-
 // validReferenceName rejects reference names that cannot be safely turned into
 // a path under the .git directory. A loose reference (and its reflog) is stored
 // verbatim at ".git/<name>", so a crafted name — for instance one advertised by
 // a malicious remote — could climb out of its reference sub-tree and read,
 // overwrite, or delete unrelated metadata such as .git/config.
 //
-// The storage-safety gate is plumbing.ReferenceName.IsSafe, mirroring Git's
+// The first gate is plumbing.ReferenceName.IsSafe, mirroring Git's
 // refname_is_safe: a name must be under refs/ without escaping it, or be a
-// [A-Z_] pseudo-ref. This alone rejects absolute, drive-prefixed, escaping and
-// single-level metadata names. On top of it, this adds filesystem-specific
-// hardening that IsSafe's literal check does not cover: control characters, and
-// components a case-insensitive/NTFS/HFS+ filesystem would fold back to "." or
-// ".." (trailing dots/spaces, Alternate Data Streams, ignorable Unicode code
-// points). The per-component check is delegated to pathutil.IsHFSDot and
-// pathutil.IsNTFSDot with "." as the needle, exactly as validSubmoduleName
-// does, and runs regardless of host OS because a name can be authored on one OS
-// and reach this layer on another.
+// one-level [A-Z_] name. That rejects absolute, drive-prefixed, escaping and
+// lowercase single-level names such as "config".
+//
+// IsSafe is not sufficient on its own. Its [A-Z_] arm accepts *any* shouting
+// one-level name, so "CONFIG", "INDEX", "SHALLOW" and "PACKED_REFS" all pass
+// it — and on a case-insensitive filesystem (APFS by default on macOS, NTFS on
+// Windows) each of those resolves to the real .git/config, .git/index,
+// .git/shallow or .git/packed-refs. Writing a reference there corrupts the
+// repository; ".git/shallow" is worse still, because a bare object id followed
+// by a newline is a *valid* shallow file and silently turns the repository into
+// a shallow one at an attacker-chosen commit. So a one-level name is accepted
+// only when plumbing.ReferenceName.IsRoot says it is a genuine root ref (HEAD,
+// the *_HEAD pseudo-refs, AUTO_MERGE and friends), mirroring Git's
+// is_root_ref. An allowlist is deliberate: denying known .git entries would be
+// incomplete by construction and would drift as Git adds files.
+//
+// On top of that, pathutil.HasUnsafeComponent adds the filesystem-specific
+// hardening IsSafe's literal ".." comparison does not cover: control
+// characters, and components a case-insensitive/NTFS/HFS+ filesystem would fold
+// back to "." or ".." (trailing dots/spaces, Alternate Data Streams, ignorable
+// Unicode code points). The receive-pack refname gate calls the same helper, so
+// the two layers cannot drift apart.
 func validReferenceName(name plumbing.ReferenceName) error {
 	if !name.IsSafe() {
-		return fmt.Errorf("%w: %q is not under refs/ nor a valid pseudo-ref", ErrReferenceNameEscape, string(name))
+		return fmt.Errorf("%w: %q is not a safe reference name", ErrReferenceNameEscape, string(name))
 	}
 
-	s := string(name)
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
-			return fmt.Errorf("%w: %q", ErrReferenceNameEscape, s)
-		}
+	if !strings.HasPrefix(string(name), refsPrefix) && !name.IsRoot() {
+		return fmt.Errorf("%w: %q is not under refs/ nor a root ref", ErrReferenceNameEscape, string(name))
 	}
-	for _, part := range strings.FieldsFunc(s, isPathSep) {
-		// IsNTFSDot/IsHFSDot with a "." needle match ".." and its disguises
-		// but not a bare ".", so reject that component explicitly too.
-		if part == "." || pathutil.IsHFSDot(part, ".") || pathutil.IsNTFSDot(part, ".", "") {
-			return fmt.Errorf("%w: %q", ErrReferenceNameEscape, s)
-		}
+
+	if pathutil.HasUnsafeComponent(string(name)) {
+		return fmt.Errorf("%w: %q has a control character or a path component that folds to a dot",
+			ErrReferenceNameEscape, string(name))
 	}
+
 	return nil
 }
 
