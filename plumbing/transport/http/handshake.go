@@ -75,11 +75,6 @@ func (t *Transport) Handshake(ctx context.Context, req *transport.Request) (tran
 		return nil, fmt.Errorf("http transport: %w", err)
 	}
 
-	if err := checkError(resp); err != nil {
-		_ = resp.Body.Close()
-		return nil, err
-	}
-
 	// Update base URL from the final redirect target.
 	redirectedURL, err := applyRedirect(resp, baseURL)
 	if err != nil {
@@ -306,12 +301,14 @@ func (s *smartPackSession) Command(ctx context.Context, cmd string, req packp.Co
 		return err
 	}
 	// Command consumes the whole response (it never streams the body out), so
-	// drain and close it on every path. A bare return on a decode error would
-	// otherwise leak the response body and its connection.
+	// release it on every path. A bare return on a decode error would otherwise
+	// leak the response body and its connection. Releasing it includes the
+	// discard: a decoder stops at the response's flush-pkt, and the request
+	// that reuses the connection — the fetch POST after an ls-refs — follows
+	// immediately.
 	defer func() {
 		if r.resp != nil {
-			_, _ = io.Copy(io.Discard, r.resp.Body)
-			_ = r.resp.Body.Close()
+			drainAndClose(r.resp.Body)
 		}
 	}()
 	if resp != nil {
@@ -533,9 +530,9 @@ type httpNegotiator struct {
 
 func (n *httpNegotiator) Write(p []byte) (int, error) {
 	if n.current != nil && n.current.resp != nil {
-		// Previous round is complete — close its response, start fresh.
-		_, _ = io.Copy(io.Discard, n.current.resp.Body)
-		_ = n.current.resp.Body.Close()
+		// The previous round is complete, and this round is the request that
+		// reuses its connection.
+		drainAndClose(n.current.resp.Body)
 		n.current = nil
 	}
 	if n.current == nil {

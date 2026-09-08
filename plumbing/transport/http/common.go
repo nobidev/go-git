@@ -3,6 +3,7 @@ package http
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -30,7 +31,42 @@ func (e *Err) Error() string {
 	return fmt.Sprintf(format, redactedURL(e.URL), e.Status)
 }
 
+// maxErrorBodySize caps how much of an error response body is read into the
+// returned error. The body may come from a server the caller never named — a
+// redirect target — so it is not read to EOF.
+const maxErrorBodySize = 8 << 10
+
+// maxDrainSize caps how much of a spent response body is discarded to keep its
+// connection reusable. Sized against what it buys: discarding the tail saves
+// one handshake, so spending more transfer than a handshake costs is a bad
+// trade. net/http draws the same line tighter still (maxBodySlurpSize, 2 KiB).
+const maxDrainSize = 64 << 10
+
+// drainAndClose releases a response body nobody will read again.
+//
+// What is left of it is discarded before the close, because net/http returns a
+// connection to the pool only once its body has reached EOF: closing with
+// bytes outstanding drops the connection instead. Those bytes are usually the
+// tail of a body that was read for something else — a message taken up to a
+// byte cap, a response a decoder left at its flush-pkt — and often just the
+// terminating chunk, for which the next request would pay a whole handshake.
+//
+// The discard stops at maxDrainSize, which bounds a server that keeps sending.
+// A server that stops sending without closing is bounded by the request's
+// context instead, since net/http ends the read when that context does.
+func drainAndClose(body io.ReadCloser) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrainSize))
+	_ = body.Close()
+}
+
 // checkError maps HTTP response status codes to typed transport errors.
+//
+// The body is consumed and closed: as much of it as maxErrorBodySize allows
+// becomes the error's Reason, the remainder is discarded, and the body is
+// closed. Discarding it keeps the connection: a 404 is ordinary control flow
+// for the dumb walk, which asks for every object as a loose file before
+// falling back to the packs, so dropping the connection of a failed request
+// would cost a handshake per object.
 func checkError(r *http.Response) error {
 	if r.StatusCode >= http.StatusOK && r.StatusCode < http.StatusMultipleChoices {
 		return nil
@@ -39,10 +75,11 @@ func checkError(r *http.Response) error {
 	var reason string
 	var messageBuffer bytes.Buffer
 	if r.Body != nil {
-		messageLength, _ := messageBuffer.ReadFrom(r.Body)
+		messageLength, _ := messageBuffer.ReadFrom(io.LimitReader(r.Body, maxErrorBodySize))
 		if messageLength > 0 {
 			reason = messageBuffer.String()
 		}
+		drainAndClose(r.Body)
 	}
 
 	err := &Err{
@@ -283,6 +320,10 @@ func redactedURL(u *url.URL) string {
 }
 
 // doRequest performs an HTTP request and returns a typed error on failure.
+//
+// An unsuccessful status yields no response: checkError has already taken what
+// it needs for the error and closed the body, so returning it would hand back
+// a response nobody can read.
 func doRequest(client *http.Client, req *http.Request) (*http.Response, error) {
 	traceHTTP := trace.HTTP.Enabled()
 	if traceHTTP {
@@ -302,7 +343,7 @@ func doRequest(client *http.Client, req *http.Request) (*http.Response, error) {
 		return res, nil
 	}
 
-	return res, checkError(res)
+	return nil, checkError(res)
 }
 
 // applyAuth sets basic auth from URL userinfo and/or the authorizer function.
