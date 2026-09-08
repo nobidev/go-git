@@ -17,6 +17,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	transport "github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
+	"github.com/go-git/go-git/v6/utils/ioutil"
 )
 
 // Handshake implements transport.Transport. GETs /info/refs to discover
@@ -328,8 +329,9 @@ func (s *smartPackSession) Fetch(ctx context.Context, st storage.Storer, req *tr
 
 	shallows, err := transport.NegotiatePack(ctx, st, s.caps, true, neg, neg, req)
 	if err != nil {
-		// Don't close the response body here — context-wrapper goroutines
-		// inside NegotiatePack may still be reading from it.
+		if ioutil.ReadFinished(ctx, err) {
+			neg.closeResponse()
+		}
 		return err
 	}
 	if neg.current == nil || neg.current.resp == nil {
@@ -339,22 +341,7 @@ func (s *smartPackSession) Fetch(ctx context.Context, st storage.Storer, req *tr
 		}
 	}
 	err = transport.FetchPack(ctx, st, s.caps, io.NopCloser(neg), shallows, req)
-	// Close the response unless the read itself was a cancellation. The race
-	// this guards against only exists on cancellation: a ctxReader goroutine
-	// inside FetchPack can still be blocked in the underlying Read after the
-	// <-ctx.Done() branch, so niling current.resp here would race it. On a
-	// non-cancellation error (or success) FetchPack's last Read returned via the
-	// result channel and its goroutine is quiescent, so closing is safe — and
-	// necessary, otherwise the response body/connection leaks. On the
-	// cancellation path the request context unblocks the in-flight read, so the
-	// body is not leaked.
-	//
-	// Classified against err itself via errors.Is, not a fresh ctx.Err() check:
-	// ctx can turn Err() non-nil an instant after FetchPack already returned
-	// with its read fully quiescent, and re-checking ctx.Err() at that later,
-	// independent point would incorrectly skip the close and leak the response
-	// (mirrors FetchV2's round loop).
-	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	if ioutil.ReadFinished(ctx, err) {
 		neg.closeResponse()
 	}
 	return err
@@ -408,15 +395,7 @@ func (s *smartPackSession) fetchV2(ctx context.Context, st storage.Storer, req *
 func (s *smartPackSession) Push(ctx context.Context, st storage.Storer, req *transport.PushRequest) error {
 	rwc := &httpRequester{session: s, ctx: ctx}
 	err := transport.SendPack(ctx, st, s.caps, rwc, io.NopCloser(rwc), req)
-	// Close the response unless the read itself was a cancellation: a ctxReader
-	// goroutine inside SendPack can still be blocked in the underlying Read
-	// after the <-ctx.Done() branch, so closing the body here would race it —
-	// the request context tears the connection down instead. On a
-	// non-cancellation error (or success) SendPack's last Read returned via the
-	// result channel and its goroutine is quiescent, so closing is safe — and
-	// necessary, otherwise the response body/connection leaks (mirrors Fetch
-	// above and FetchV2's round loop).
-	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && rwc.resp != nil {
+	if ioutil.ReadFinished(ctx, err) && rwc.resp != nil {
 		_ = rwc.resp.Body.Close()
 	}
 	return err
@@ -555,8 +534,13 @@ func (n *httpNegotiator) Close() error {
 	return n.current.Close()
 }
 
-// closeResponse closes the current HTTP response body.
-// The caller (FetchPack) is expected to have already drained the body.
+// closeResponse closes the current round's response body, without discarding
+// what is left of it: Fetch calls this when it is finished with the negotiator
+// altogether, so no request follows that the connection could serve.
+//
+// Whether the body was read to its end is the caller's affair. So is whether
+// closing is safe at all — ioutil.ReadFinished answers that, and a caller that
+// does not ask races the context reader wrapped around this body.
 func (n *httpNegotiator) closeResponse() {
 	if n.current != nil && n.current.resp != nil {
 		_ = n.current.resp.Body.Close()
