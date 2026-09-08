@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	transport "github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/utils/trace"
@@ -57,6 +58,24 @@ const maxDrainSize = 64 << 10
 func drainAndClose(body io.ReadCloser) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrainSize))
 	_ = body.Close()
+}
+
+// trimPartialRune drops a trailing byte sequence that cannot be a character on
+// its own, which a cap measured in bytes leaves behind in the middle of a
+// multi-byte one. Text that was never UTF-8 keeps whatever it had; %q escapes
+// those bytes either way, and this only spares the reader an escape for half a
+// character the server did send in full.
+func trimPartialRune(b []byte) []byte {
+	for i := len(b) - 1; i >= 0 && i > len(b)-utf8.UTFMax; i-- {
+		if !utf8.RuneStart(b[i]) {
+			continue
+		}
+		if r, size := utf8.DecodeRune(b[i:]); r == utf8.RuneError && size <= 1 {
+			return b[:i]
+		}
+		break
+	}
+	return b
 }
 
 // contentMediaType returns the media type of a Content-Type header, without

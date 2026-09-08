@@ -574,3 +574,35 @@ func TestSmartContentType(t *testing.T) {
 		})
 	}
 }
+
+// TestTrimPartialRune covers what a cap measured in bytes leaves behind. A
+// message cut in the middle of a multi-byte character ends in bytes that are
+// not one, and %q renders those as escapes for a character the server sent
+// whole.
+func TestTrimPartialRune(t *testing.T) {
+	t.Parallel()
+
+	const euro = "€" // three bytes
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"ascii", "abc", "abc"},
+		{"whole character at the end", "ab" + euro, "ab" + euro},
+		{"one byte short", "ab" + euro[:2], "ab"},
+		{"two bytes short", "ab" + euro[:1], "ab"},
+		{"nothing but a partial character", euro[:2], ""},
+		{"stray byte at the end", "a\xff", "a"},
+		{"stray byte in the middle", "a\xffb", "a\xffb"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, string(trimPartialRune([]byte(tt.in))))
+		})
+	}
+}
