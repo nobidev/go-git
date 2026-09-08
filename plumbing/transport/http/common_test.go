@@ -546,3 +546,31 @@ func TestErrorResponseKeepsConnection(t *testing.T) {
 		})
 	}
 }
+
+func TestSmartContentType(t *testing.T) {
+	t.Parallel()
+
+	// Git compares a parameter-stripped, lower-cased media type
+	// (http.c extract_content_type), so all of these are the smart protocol.
+	for _, tc := range []struct {
+		name   string
+		header string
+		want   bool
+	}{
+		{"exact", "application/x-git-upload-pack-advertisement", true},
+		{"charset parameter", "application/x-git-upload-pack-advertisement; charset=utf-8", true},
+		{"upper case", "APPLICATION/X-GIT-UPLOAD-PACK-ADVERTISEMENT", true},
+		{"spaced parameter", "application/x-git-upload-pack-advertisement ; charset=utf-8", true},
+		{"malformed parameter", "application/x-git-upload-pack-advertisement; charset", true},
+		{"dumb text", "text/plain", false},
+		{"html", "text/html; charset=utf-8", false},
+		{"wrong service", "application/x-git-receive-pack-advertisement", false},
+		{"result not advertisement", "application/x-git-upload-pack-result", false},
+		{"empty", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, smartContentType(tc.header, "git-upload-pack"))
+		})
+	}
+}

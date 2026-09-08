@@ -123,10 +123,7 @@ func (t *Transport) Handshake(ctx context.Context, req *transport.Request) (tran
 		return handshakeDumb(resp, &sessReq, client, authorizer)
 	}
 
-	expected := fmt.Sprintf("application/x-%s-advertisement", discoverService)
-	isSmart := resp.Header.Get("Content-Type") == expected
-
-	if isSmart {
+	if smartContentType(resp.Header.Get("Content-Type"), discoverService) {
 		return handshakeSmart(resp, &sessReq, discoverService, client, authorizer)
 	}
 	return handshakeDumb(resp, &sessReq, client, authorizer)
