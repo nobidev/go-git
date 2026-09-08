@@ -131,7 +131,11 @@ func (t *Transport) Handshake(ctx context.Context, req *transport.Request) (tran
 }
 
 func handshakeSmart(resp *http.Response, req *transport.Request, discoverService string, client *http.Client, authorizer func(*http.Request) error) (transport.Session, error) {
-	defer resp.Body.Close() //nolint:errcheck
+	// The advertisement ends at a flush-pkt, which leaves the rest of the body
+	// — the terminating chunk, on a chunked response — outstanding. The POST
+	// that opens the session follows immediately, so the discard is what
+	// decides whether it reuses this connection.
+	defer drainAndClose(resp.Body)
 	rd := bufio.NewReader(resp.Body)
 
 	_, prefix, err := pktline.PeekLine(rd)
