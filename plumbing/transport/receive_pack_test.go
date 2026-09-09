@@ -893,3 +893,221 @@ func TestReceivePackUnpackFailure(t *testing.T) {
 		assert.Contains(t, demuxed.data.String(), "unpack ")
 	})
 }
+
+// TestReceivePackRefusesDuplicateRefname pins the bytes, because one status
+// line per command is the property at stake: a client pairs the lines with the
+// commands it sent positionally, so two commands must produce two lines even
+// when both name the same ref and both carry the same reason.
+func TestReceivePackRefusesDuplicateRefname(t *testing.T) {
+	t.Parallel()
+
+	ref := plumbing.ReferenceName("refs/heads/main")
+	old := plumbing.NewHash(receivePackTestHash)
+	st := seedRef(t, ref, old)
+
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: ref, Old: old, New: plumbing.NewHash("1111111111111111111111111111111111111111")},
+			{Name: ref, Old: old, New: plumbing.NewHash("2222222222222222222222222222222222222222")},
+		}),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{StatelessRPC: true},
+	)
+	require.ErrorIs(t, err, ErrDuplicateRefname)
+	// The caller is told which name was duplicated; the wire reason is not.
+	assert.Contains(t, err.Error(), `"refs/heads/main"`)
+
+	assert.Equal(t, "000eunpack ok\n"+
+		"003cng refs/heads/main multiple updates for ref not allowed\n"+
+		"003cng refs/heads/main multiple updates for ref not allowed\n"+
+		"0000", out.String())
+
+	// Neither command ran, so the ref still holds what it held before.
+	got, refErr := st.Reference(ref)
+	require.NoError(t, refErr)
+	assert.Equal(t, old, got.Hash())
+}
+
+// TestReceivePackDuplicateRefnameRefusesWholePush covers the refs that named a
+// reference only once. Git batches the updates into a transaction that the
+// duplicate aborts, so those refs do not move either and are answered "ng"
+// alongside it; a push applies as sent or not at all.
+func TestReceivePackDuplicateRefnameRefusesWholePush(t *testing.T) {
+	t.Parallel()
+
+	dup := plumbing.ReferenceName("refs/heads/dup")
+	innocent := plumbing.ReferenceName("refs/heads/innocent")
+	hash := plumbing.NewHash(receivePackTestHash)
+	st := memory.NewStorage()
+
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: dup, Old: plumbing.ZeroHash, New: hash},
+			{Name: innocent, Old: plumbing.ZeroHash, New: hash},
+			{Name: dup, Old: plumbing.ZeroHash, New: hash},
+		}),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{StatelessRPC: true},
+	)
+	require.ErrorIs(t, err, ErrDuplicateRefname)
+
+	assert.Equal(t, "000eunpack ok\n"+
+		"003bng refs/heads/dup multiple updates for ref not allowed\n"+
+		"0040ng refs/heads/innocent multiple updates for ref not allowed\n"+
+		"003bng refs/heads/dup multiple updates for ref not allowed\n"+
+		"0000", out.String())
+
+	for _, n := range []plumbing.ReferenceName{dup, innocent} {
+		_, refErr := st.Reference(n)
+		assert.ErrorIs(t, refErr, plumbing.ErrReferenceNotFound, "ref %q", n)
+	}
+}
+
+// TestReceivePackDuplicateRefnameMixedActions covers a duplicate whose two
+// commands disagree about the action. Real git splits deletes from updates into
+// separate transactions, so there the delete lands while every command still
+// reports failure; refusing the request before anything runs keeps the report
+// and the repository saying the same thing.
+func TestReceivePackDuplicateRefnameMixedActions(t *testing.T) {
+	t.Parallel()
+
+	ref := plumbing.ReferenceName("refs/heads/main")
+	old := plumbing.NewHash(receivePackTestHash)
+	st := seedRef(t, ref, old)
+
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: ref, Old: old, New: plumbing.NewHash("1111111111111111111111111111111111111111")},
+			deleteCmd(ref, old),
+		}),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{StatelessRPC: true},
+	)
+	require.ErrorIs(t, err, ErrDuplicateRefname)
+
+	got, refErr := st.Reference(ref)
+	require.NoError(t, refErr, "the delete must not have run")
+	assert.Equal(t, old, got.Hash(), "the update must not have run")
+}
+
+// TestReceivePackDuplicateRefnameSkipsHooks asserts the request is refused
+// before PreReceive. A hook decides policy and may have side effects of its
+// own, so it is not consulted about a push that cannot apply whatever it
+// answers.
+func TestReceivePackDuplicateRefnameSkipsHooks(t *testing.T) {
+	t.Parallel()
+
+	ref := plumbing.ReferenceName("refs/heads/main")
+	hash := plumbing.NewHash(receivePackTestHash)
+	st := memory.NewStorage()
+
+	var preCalled, postCalled bool
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: ref, Old: plumbing.ZeroHash, New: hash},
+			{Name: ref, Old: plumbing.ZeroHash, New: hash},
+		}),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{
+			StatelessRPC: true,
+			Hooks: ReceivePackHooks{
+				PreReceive: func(context.Context, *PreReceiveInfo) error {
+					preCalled = true
+					return nil
+				},
+				PostReceive: func(context.Context, *PostReceiveInfo) error {
+					postCalled = true
+					return nil
+				},
+			},
+		},
+	)
+	require.ErrorIs(t, err, ErrDuplicateRefname)
+	assert.False(t, preCalled, "PreReceive must not run for an unapplyable push")
+	assert.False(t, postCalled, "PostReceive must not run when no ref moved")
+}
+
+// TestReceivePackDuplicateRefnameOnSideband checks the refusal takes the same
+// route as the other reporting exits: muxed into band 1, then the flush that
+// ends the stream the client is demuxing.
+func TestReceivePackDuplicateRefnameOnSideband(t *testing.T) {
+	t.Parallel()
+
+	ref := plumbing.ReferenceName("refs/heads/main")
+	hash := plumbing.NewHash(receivePackTestHash)
+	st := memory.NewStorage()
+
+	var out bytes.Buffer
+	err := ReceivePack(
+		context.Background(),
+		st,
+		receivePackRequest(t, []*packp.Command{
+			{Name: ref, Old: plumbing.ZeroHash, New: hash},
+			{Name: ref, Old: plumbing.ZeroHash, New: hash},
+		}, capability.Sideband64k),
+		ioutil.WriteNopCloser(&out),
+		&ReceivePackRequest{StatelessRPC: true},
+	)
+	require.ErrorIs(t, err, ErrDuplicateRefname)
+
+	demuxed := readSideband(t, &out)
+	assert.Contains(t, demuxed.data.String(), "unpack ok")
+	assert.Equal(t, 2, strings.Count(demuxed.data.String(),
+		"ng refs/heads/main multiple updates for ref not allowed"))
+}
+
+func TestDuplicateRefname(t *testing.T) {
+	t.Parallel()
+
+	cmd := func(n string) *packp.Command {
+		return &packp.Command{Name: plumbing.ReferenceName(n)}
+	}
+
+	for _, tc := range []struct {
+		name string
+		cmds []*packp.Command
+		want string
+	}{
+		{name: "nil", cmds: nil, want: ""},
+		{name: "one", cmds: []*packp.Command{cmd("refs/heads/a")}, want: ""},
+		{
+			name: "distinct",
+			cmds: []*packp.Command{cmd("refs/heads/a"), cmd("refs/heads/b")},
+			want: "",
+		},
+		{
+			name: "adjacent",
+			cmds: []*packp.Command{cmd("refs/heads/a"), cmd("refs/heads/a")},
+			want: "refs/heads/a",
+		},
+		{
+			name: "apart",
+			cmds: []*packp.Command{cmd("refs/heads/a"), cmd("refs/heads/b"), cmd("refs/heads/a")},
+			want: "refs/heads/a",
+		},
+		{
+			name: "reports the second name repeated, not the first seen",
+			cmds: []*packp.Command{cmd("refs/heads/a"), cmd("refs/heads/b"), cmd("refs/heads/b")},
+			want: "refs/heads/b",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := duplicateRefname(tc.cmds)
+			assert.Equal(t, tc.want != "", ok)
+			assert.Equal(t, plumbing.ReferenceName(tc.want), got)
+		})
+	}
+}

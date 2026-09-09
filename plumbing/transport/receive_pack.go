@@ -245,6 +245,35 @@ func ReceivePack(
 		return unpackErr
 	}
 
+	// A name carried by more than one command makes the push unapplyable: the
+	// commands contradict each other, and cmdStatus holds a single outcome per
+	// name, so running both would report one of them and hide the other.
+	//
+	// git refuses such a push outright. It batches the ref updates into a
+	// transaction, and a repeated name aborts the transaction with "multiple
+	// updates for ref <name> not allowed", so no ref in the batch moves and
+	// every command is answered "ng" — including the commands that named a
+	// reference only once. Refuse the whole request the same way, rather than
+	// only the duplicated name, so a push either applies as sent or not at all.
+	//
+	// Unlike git this runs before PreReceive. A hook is a policy gate that may
+	// have side effects of its own, so it is not asked to authorise a request
+	// that cannot be applied whatever it answers.
+	if dup, ok := duplicateRefname(updreq.Commands); ok {
+		rejected := make(map[plumbing.ReferenceName]error, len(updreq.Commands))
+		for _, cmd := range updreq.Commands {
+			// sendReportStatus writes Error() into the "ng <ref> <reason>"
+			// line, so the reason stays the bare sentinel: the line already
+			// names the ref it speaks for, and git is no more specific here
+			// either. Which name was duplicated goes to the caller instead.
+			rejected[cmd.Name] = ErrDuplicateRefname
+		}
+		if err := report(nil, rejected); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: %q", ErrDuplicateRefname, dup)
+	}
+
 	if opts.Hooks.PreReceive != nil {
 		info := &PreReceiveInfo{
 			Storer:      st,
@@ -315,9 +344,12 @@ func closeWriter(w io.WriteCloser) error {
 // The lines follow cmds, not the cmdStatus map. Git reports in the order the
 // commands arrived and a client is entitled to pair the two up positionally,
 // whereas ranging over the map orders them differently on every push. A command
-// with no entry in cmdStatus was never attempted and is not reported; a name
-// repeated across commands is reported once, because the map holds one outcome
-// for it.
+// with no entry in cmdStatus was never attempted and is not reported.
+//
+// One line is written per command, not per distinct name, which is what keeps
+// that pairing positional: git answers a name carried by two commands with two
+// ng lines. Both lines say the same thing here, because a duplicated name is
+// refused before any command runs and the map holds one outcome for it.
 func sendReportStatus(w io.WriteCloser, cmds []*packp.Command, unpackErr error, cmdStatus map[plumbing.ReferenceName]error) error {
 	rs := &packp.ReportStatus{}
 	rs.UnpackStatus = "ok"
@@ -325,16 +357,11 @@ func sendReportStatus(w io.WriteCloser, cmds []*packp.Command, unpackErr error, 
 		rs.UnpackStatus = unpackErr.Error()
 	}
 
-	reported := make(map[plumbing.ReferenceName]struct{}, len(cmdStatus))
 	for _, cmd := range cmds {
 		err, ok := cmdStatus[cmd.Name]
 		if !ok {
 			continue
 		}
-		if _, done := reported[cmd.Name]; done {
-			continue
-		}
-		reported[cmd.Name] = struct{}{}
 
 		msg := "ok"
 		if err != nil {
@@ -352,6 +379,19 @@ func sendReportStatus(w io.WriteCloser, cmds []*packp.Command, unpackErr error, 
 	}
 
 	return nil
+}
+
+// duplicateRefname returns the first reference name that more than one command
+// in cmds updates, and whether there was one.
+func duplicateRefname(cmds []*packp.Command) (plumbing.ReferenceName, bool) {
+	seen := make(map[plumbing.ReferenceName]struct{}, len(cmds))
+	for _, cmd := range cmds {
+		if _, ok := seen[cmd.Name]; ok {
+			return cmd.Name, true
+		}
+		seen[cmd.Name] = struct{}{}
+	}
+	return "", false
 }
 
 func setStatus(cmdStatus map[plumbing.ReferenceName]error, firstErr *error, ref plumbing.ReferenceName, err error) {

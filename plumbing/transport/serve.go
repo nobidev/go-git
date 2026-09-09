@@ -23,6 +23,10 @@ var ErrUpdateReference = errors.New("failed to update ref")
 // to touch: one that is not under refs/, or one whose name is malformed.
 var ErrFunnyRefname = errors.New("funny refname")
 
+// ErrDuplicateRefname is reported for every command of a push whose command
+// list updates one reference more than once.
+var ErrDuplicateRefname = errors.New("multiple updates for ref not allowed")
+
 // AdvertiseRefs is a server command that implements the reference
 // discovery phase of the v0/v1 Git transfer protocol. Protocol v2 advertises
 // capabilities only, via [AdvertiseCapabilities]; the sole reason this function
