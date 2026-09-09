@@ -154,8 +154,10 @@ func (s *SuiteDotGit) TestReferenceNameRejectsDisguisedSelfReference() {
 	// A component that folds to a single "." names the directory it sits in,
 	// so each of these resolves to refs/heads/main once joined: HFS+ drops the
 	// ignorable code points, and NTFS trims the trailing space or truncates at
-	// the Alternate Data Stream colon. IsSafe compares components literally and
-	// this layer never runs Validate, so nothing else here stops them.
+	// the Alternate Data Stream colon. HasUnsafeComponent is what stops them:
+	// IsSafe compares components literally, and Validate only refuses the
+	// spellings whose dot comes first, so rule 1 passes a component that
+	// leads with the zero-width non-joiner and carries the dot second.
 	for _, n := range []plumbing.ReferenceName{
 		"refs/heads/\u200c./main",
 		"refs/heads/.\u200c/main",
@@ -238,6 +240,58 @@ func (s *SuiteDotGit) TestReferenceNameRejectsTopLevelMetadata() {
 		_, err := d.fs.Stat(p)
 		s.Error(err, "must not create .git/%s", p)
 	}
+}
+
+func (s *SuiteDotGit) TestReferenceNameRejectsNamesOnlyValidateCatches() {
+	d := New(s.EmptyFS())
+	s.Require().NoError(d.Initialize())
+
+	// These are under refs/, escape nothing, and hold no component that folds
+	// to a dot, so IsSafe and HasUnsafeComponent both pass them and only
+	// Validate refuses them. The storage layer needs it because a fetch
+	// reaches here with a name the remote chose, after refspec mapping.
+	//
+	// A ".lock" suffix is the one that does damage without looking like an
+	// escape. Git never reads .git/refs/heads/main.lock as a reference, so the
+	// name looks harmless, but that path is the lock file git creates to
+	// update refs/heads/main: once one is left behind, every later update of
+	// that ref fails with "File exists" and the advice that a lock file may be
+	// stale, until someone deletes it by hand.
+	bad := []plumbing.ReferenceName{
+		"refs/heads/main.lock",
+		"refs/remotes/origin/main.lock",
+		"refs/heads/sub/main.lock",
+		"refs/heads/.hidden",
+		"refs/heads/foo bar",
+		"refs/heads/foo~1",
+		"refs/heads/foo^",
+		"refs/heads/foo:bar",
+		"refs/heads/foo?",
+		"refs/heads/foo*",
+		"refs/heads/foo[",
+		"refs/heads/foo@{1}",
+	}
+	for _, n := range bad {
+		ref := plumbing.NewHashReference(n, plumbing.NewHash("e8d3ffab552895c19b9fcf7aa264d277cde33881"))
+
+		err := d.SetRef(ref, nil)
+		s.ErrorIs(err, ErrReferenceNameEscape, "SetRef %q", n)
+		// Assert the wrapped cause too, so the case keeps testing Validate
+		// rather than passing on whichever check happens to run first.
+		s.ErrorIs(err, plumbing.ErrInvalidReferenceName, "SetRef %q", n)
+
+		s.ErrorIs(d.RemoveRef(n), ErrReferenceNameEscape, "RemoveRef %q", n)
+
+		_, err = d.Ref(n)
+		s.ErrorIs(err, ErrReferenceNameEscape, "Ref %q", n)
+
+		_, err = d.ReflogWriter(n)
+		s.ErrorIs(err, ErrReferenceNameEscape, "ReflogWriter %q", n)
+	}
+
+	entries, err := d.fs.ReadDir(d.fs.Join(refsPath, "heads"))
+	s.NoError(err)
+	s.Empty(entries, "no refused name may have become a path")
 }
 
 func (s *SuiteDotGit) TestReferenceNameAcceptsBenignNames() {

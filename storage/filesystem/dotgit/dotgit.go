@@ -133,18 +133,36 @@ var (
 // back to "." or ".." (trailing dots/spaces, Alternate Data Streams, ignorable
 // Unicode code points). The receive-pack refname gate calls the same helper, so
 // the two layers cannot drift apart.
+//
+// Finally, a name under refs/ is put through plumbing.ReferenceName.Validate,
+// go-git's check_refname_format, for the character and component rules none of
+// the checks above cover. Validate requires a "/", so a root ref is gated by
+// IsRoot alone.
 func validReferenceName(name plumbing.ReferenceName) error {
 	if !name.IsSafe() {
 		return fmt.Errorf("%w: %q is not a safe reference name", ErrReferenceNameEscape, string(name))
 	}
 
-	if !strings.HasPrefix(string(name), refsPrefix) && !name.IsRoot() {
+	underRefs := strings.HasPrefix(string(name), refsPrefix)
+	if !underRefs && !name.IsRoot() {
 		return fmt.Errorf("%w: %q is not under refs/ nor a root ref", ErrReferenceNameEscape, string(name))
 	}
 
 	if pathutil.HasUnsafeComponent(string(name)) {
 		return fmt.Errorf("%w: %q has a control character or a path component that folds to a dot",
 			ErrReferenceNameEscape, string(name))
+	}
+
+	// Of those rules the ".lock" suffix is the one that does damage without
+	// looking like an escape, and a fetch reaches here with a name the remote
+	// chose. Git never reads .git/refs/heads/main.lock as a reference, so the
+	// name looks inert, but that path is the lock file git creates to update
+	// refs/heads/main: storing one makes every later update of that ref fail
+	// with "File exists" until someone deletes it by hand.
+	if underRefs {
+		if err := name.Validate(); err != nil {
+			return fmt.Errorf("%w: %w", ErrReferenceNameEscape, err)
+		}
 	}
 
 	return nil
