@@ -13,19 +13,25 @@ import (
 // Encoder writes MemoryIndex structs to an output stream.
 type Encoder struct {
 	io.Writer
-	hash hash.Hash
+	hash      hash.Hash
+	optionErr error
 }
 
-// NewEncoder returns a new stream encoder that writes to w.
-func NewEncoder(w io.Writer) *Encoder {
-	// TODO: Support passing an ObjectFormat (sha256)
-	h := hash.New(crypto.SHA1)
-	mw := io.MultiWriter(w, h)
-	return &Encoder{mw, h}
+// NewEncoder returns a new stream encoder that writes to w. The object
+// format defaults to SHA-1; use WithObjectFormat for SHA-256. Invalid options
+// are reported by Encode before writing any bytes.
+func NewEncoder(w io.Writer, opts ...Option) *Encoder {
+	o, err := readOptions(opts)
+	h := hash.New(o.hashAlgorithm())
+	return &Encoder{Writer: io.MultiWriter(w, h), hash: h, optionErr: err}
 }
 
 // Encode writes an index into the commit-graph file
 func (e *Encoder) Encode(idx Index) error {
+	if e.optionErr != nil {
+		return e.optionErr
+	}
+	e.hash.Reset()
 	// Get all the hashes in the input index
 	hashes := idx.Hashes()
 
@@ -101,6 +107,9 @@ func (e *Encoder) prepare(idx Index, hashes []plumbing.Hash) (hashToIndex map[pl
 	hashToIndex = make(map[plumbing.Hash]uint32)
 	fanout = make([]uint32, lenFanout)
 	for i, hash := range hashes {
+		if hash.Size() != e.hash.Size() {
+			return nil, nil, 0, 0, ErrUnsupportedHash
+		}
 		hashToIndex[hash] = uint32(i)
 		fanout[hash.Bytes()[0]]++
 	}
@@ -115,10 +124,22 @@ func (e *Encoder) prepare(idx Index, hashes []plumbing.Hash) (hashToIndex map[pl
 	// Find out if we will need extra edge table. An index that cannot satisfy
 	// the lookup returns a nil CommitData, so the error has to be checked
 	// before v is dereferenced.
-	for i := range len(hashes) {
-		v, err := idx.GetCommitDataByIndex(uint32(i))
+	for _, h := range hashes {
+		originalIndex, err := idx.GetIndexByHash(h)
 		if err != nil {
 			return nil, nil, 0, 0, err
+		}
+		v, err := idx.GetCommitDataByIndex(originalIndex)
+		if err != nil {
+			return nil, nil, 0, 0, err
+		}
+		if v.TreeHash.Size() != e.hash.Size() {
+			return nil, nil, 0, 0, ErrUnsupportedHash
+		}
+		for _, parent := range v.ParentHashes {
+			if parent.Size() != e.hash.Size() {
+				return nil, nil, 0, 0, ErrUnsupportedHash
+			}
 		}
 		if len(v.ParentHashes) > 2 {
 			extraEdgesCount += uint32(len(v.ParentHashes) - 1)
@@ -137,7 +158,7 @@ func (e *Encoder) encodeFileHeader(chunkCount int) (err error) {
 	}
 	if _, err = e.Write(commitFileSignature); err == nil {
 		version := byte(1)
-		if crypto.Hash(e.hash.Size()) == crypto.Hash(crypto.SHA256.Size()) {
+		if e.hash.Size() == crypto.SHA256.Size() {
 			version = byte(2)
 		}
 		_, err = e.Write([]byte{1, version, byte(chunkCount), 0})

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/utils/binary"
 )
 
@@ -19,8 +18,7 @@ var (
 	// file version is not supported.
 	ErrUnsupportedVersion = errors.New("unsupported version")
 	// ErrUnsupportedHash is returned by OpenFileIndex when the commit graph
-	// hash function is not supported. Currently only SHA-1 is defined and
-	// supported.
+	// hash function is unsupported or differs from the selected object format.
 	ErrUnsupportedHash = errors.New("unsupported hash algorithm")
 	// ErrMalformedCommitGraphFile is returned by OpenFileIndex when the commit
 	// graph file is corrupted.
@@ -86,6 +84,16 @@ type fileIndex struct {
 	objSize               int
 	numChunks             uint8
 	fileSize              int64
+	trailerOffset         int64
+	graphOID              plumbing.Hash
+}
+
+// newHash returns a zero hash sized for this index's object format, so
+// ReadFrom consumes objSize bytes (20 for SHA-1, 32 for SHA-256).
+func (fi *fileIndex) newHash() plumbing.Hash {
+	var h plumbing.Hash
+	h.ResetBySize(fi.objSize)
+	return h
 }
 
 // ReaderAtCloser is an interface that combines io.ReaderAt and io.Closer.
@@ -99,24 +107,34 @@ type ReaderAtCloser interface {
 //
 // On success the returned Index owns reader and closes it on Close. On
 // error reader is left open and the caller remains responsible for it.
-func OpenFileIndex(reader ReaderAtCloser) (Index, error) {
-	return OpenFileIndexWithParent(reader, nil)
+func OpenFileIndex(reader ReaderAtCloser, opts ...Option) (Index, error) {
+	return OpenFileIndexWithParent(reader, nil, opts...)
 }
 
 // OpenFileIndexWithParent opens a serialized commit graph file in the format described at
 // https://github.com/git/git/blob/v2.54.0/Documentation/technical/commit-graph-format.adoc
 //
+// File-backed parents are checked against the BASE chunk. Other Index
+// implementations remain supported, but their graph identities cannot be verified.
+//
 // On success the returned Index owns reader and parent and closes both on
 // Close. On error neither is closed and the caller remains responsible
 // for them.
-func OpenFileIndexWithParent(reader ReaderAtCloser, parent Index) (Index, error) {
+func OpenFileIndexWithParent(reader ReaderAtCloser, parent Index, opts ...Option) (Index, error) {
+	o, err := readOptions(opts)
+	if err != nil {
+		return nil, err
+	}
 	if reader == nil {
 		return nil, io.ErrUnexpectedEOF
 	}
-	fi := &fileIndex{reader: reader, parent: parent, objSize: config.SHA1Size}
+	fi := &fileIndex{reader: reader, parent: parent}
 
 	if err := fi.verifyFileHeader(); err != nil {
 		return nil, err
+	}
+	if fi.objSize != o.objectFormat.Size() {
+		return nil, ErrUnsupportedHash
 	}
 	if err := fi.verifyFileSize(); err != nil {
 		return nil, err
@@ -130,6 +148,16 @@ func OpenFileIndexWithParent(reader ReaderAtCloser, parent Index) (Index, error)
 	if err := fi.readFanout(); err != nil {
 		return nil, err
 	}
+	fi.graphOID = fi.newHash()
+	if fi.fileSize != 0 {
+		fi.trailerOffset = fi.fileSize - int64(fi.objSize)
+	}
+	if _, err := fi.graphOID.ReadFrom(io.NewSectionReader(fi.reader, fi.trailerOffset, int64(fi.objSize))); err != nil {
+		return nil, err
+	}
+	if err := fi.verifyBaseGraphs(); err != nil {
+		return nil, err
+	}
 
 	fi.hasGenerationV2 = fi.offsets[GenerationDataChunk] > 0
 	if fi.parent != nil {
@@ -141,6 +169,46 @@ func OpenFileIndexWithParent(reader ReaderAtCloser, parent Index) (Index, error)
 	}
 
 	return fi, nil
+}
+
+// verifyBaseGraphs follows Git's add_graph_to_chain: the actual chain and
+// BASE OIDs determine membership, independently of the wrapping header byte.
+func (fi *fileIndex) verifyBaseGraphs() error {
+	var parents []*fileIndex
+	for parent := fi.parent; parent != nil; {
+		p, ok := parent.(*fileIndex)
+		if !ok {
+			for _, h := range parent.Hashes() {
+				if h.Size() != fi.objSize {
+					return ErrUnsupportedHash
+				}
+			}
+			// An opaque ancestor does not expose layer positions or graph OIDs.
+			return nil
+		}
+		if p.objSize != fi.objSize {
+			return ErrUnsupportedHash
+		}
+		parents = append(parents, p)
+		parent = p.parent
+	}
+	if len(parents) == 0 {
+		return nil
+	}
+	if fi.offsets[BaseGraphsListChunk] == 0 || fi.sizes[BaseGraphsListChunk]/int64(fi.objSize) < int64(len(parents)) {
+		return ErrMalformedCommitGraphFile
+	}
+	for i := range parents {
+		h := fi.newHash()
+		offset := fi.offsets[BaseGraphsListChunk] + int64(i)*int64(fi.objSize)
+		if _, err := h.ReadFrom(io.NewSectionReader(fi.reader, offset, int64(fi.objSize))); err != nil {
+			return err
+		}
+		if h != parents[len(parents)-1-i].graphOID {
+			return ErrMalformedCommitGraphFile
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying reader and the parent index if it exists.
@@ -176,12 +244,19 @@ func (fi *fileIndex) verifyFileHeader() error {
 	if header[0] != 1 {
 		return ErrUnsupportedVersion
 	}
-	if (fi.objSize != crypto.SHA1.Size() || header[1] != 1) &&
-		(fi.objSize != crypto.SHA256.Size() || header[1] != 2) {
-		// Unknown hash type / unsupported hash type
+	// header[1] is the hash version: 1 == SHA-1, 2 == SHA-256. It
+	// determines the on-disk OID width used by every subsequent read.
+	switch header[1] {
+	case 1:
+		fi.objSize = crypto.SHA1.Size()
+	case 2:
+		fi.objSize = crypto.SHA256.Size()
+	default:
 		return ErrUnsupportedHash
 	}
 	fi.numChunks = header[2]
+	// Git writes header[3] as a byte but does not read it when loading.
+	// The BASE chunk is validated against the actual linked graph identities.
 
 	return nil
 }
@@ -265,9 +340,7 @@ func (fi *fileIndex) readChunkHeaders() error {
 	// instead of a linear scan; the semantics are identical.
 	seen := make(map[[szChunkSig]byte]struct{}, int(fi.numChunks))
 
-	// assigned records, in file order, every chunk whose offset was stored in
-	// fi.offsets. After the terminator offset is known, a second pass derives
-	// fi.sizes from consecutive offset differences.
+	// Unknown chunks also delimit the preceding chunk's data.
 	assigned := make([]chunkAssignment, 0, int(fi.numChunks))
 
 	for i := range int(fi.numChunks) {
@@ -300,6 +373,7 @@ func (fi *fileIndex) readChunkHeaders() error {
 
 		chunkType, ok := ChunkTypeFromBytes(chunkID)
 		if !ok {
+			assigned = append(assigned, chunkAssignment{ct: ZeroChunk, offset: int64(chunkOffset)})
 			continue
 		}
 		// A zero chunk-id inside the declared count is the same condition
@@ -309,6 +383,7 @@ func (fi *fileIndex) readChunkHeaders() error {
 			return ErrMalformedCommitGraphFile
 		}
 		if int(chunkType) >= len(fi.offsets) {
+			assigned = append(assigned, chunkAssignment{ct: ZeroChunk, offset: int64(chunkOffset)})
 			continue
 		}
 		fi.offsets[chunkType] = int64(chunkOffset)
@@ -331,7 +406,14 @@ func (fi *fileIndex) readChunkHeaders() error {
 	if err != nil {
 		return err
 	}
+	if int64(terminatorOffset) < prevOffset || terminatorOffset > uint64(upperBound) {
+		return ErrMalformedCommitGraphFile
+	}
+	fi.trailerOffset = int64(terminatorOffset)
 	for i, a := range assigned {
+		if a.ct == ZeroChunk {
+			continue
+		}
 		var end int64
 		if i+1 < len(assigned) {
 			end = assigned[i+1].offset
@@ -404,6 +486,15 @@ func (fi *fileIndex) readFanout() error {
 		if fanoutValue > 0x7fffffff {
 			return ErrMalformedCommitGraphFile
 		}
+		// The fanout is cumulative, so it must be monotonically
+		// non-decreasing. Canonical Git rejects an out-of-order fanout in
+		// graph_read_oid_fanout (commit-graph.c v2.54.0, "commit-graph
+		// fanout values out of order"); mirror that, both to reject
+		// corrupt files and to keep GetIndexByHash's binary search bound
+		// (high = fanout[b]) within the OID lookup chunk.
+		if i > 0 && fanoutValue < fi.fanout[i-1] {
+			return ErrMalformedCommitGraphFile
+		}
 		fi.fanout[i] = fanoutValue
 	}
 	return nil
@@ -411,7 +502,10 @@ func (fi *fileIndex) readFanout() error {
 
 // GetIndexByHash looks up the provided hash in the commit-graph fanout and returns the index of the commit data for the given hash.
 func (fi *fileIndex) GetIndexByHash(h plumbing.Hash) (uint32, error) {
-	var oid plumbing.Hash
+	if h.Size() != fi.objSize {
+		return 0, ErrUnsupportedHash
+	}
+	oid := fi.newHash()
 
 	// Find the hash in the oid lookup table
 	var low uint32
@@ -470,8 +564,7 @@ func (fi *fileIndex) GetCommitDataByIndex(idx uint32) (*CommitData, error) {
 	offset := fi.offsets[CommitDataChunk] + int64(idx)*int64(fi.objSize+szCommitData)
 	commitDataReader := io.NewSectionReader(fi.reader, offset, int64(fi.objSize+szCommitData))
 
-	// TODO: Add support for SHA256
-	var treeHash plumbing.Hash
+	treeHash := fi.newHash()
 	_, err := treeHash.ReadFrom(commitDataReader)
 	if err != nil {
 		return nil, err
@@ -596,8 +689,9 @@ func (fi *fileIndex) GetHashByIndex(idx uint32) (found plumbing.Hash, err error)
 		return found, ErrMalformedCommitGraphFile
 	}
 
+	found = fi.newHash()
 	offset := fi.offsets[OIDLookupChunk] + int64(idx)*int64(fi.objSize)
-	if _, err := found.ReadFrom(io.NewSectionReader(fi.reader, offset, int64(found.Size()))); err != nil {
+	if _, err := found.ReadFrom(io.NewSectionReader(fi.reader, offset, int64(fi.objSize))); err != nil {
 		return found, err
 	}
 
@@ -626,8 +720,9 @@ func (fi *fileIndex) getHashesFromIndexes(indexes []uint32) ([]plumbing.Hash, er
 			return nil, ErrMalformedCommitGraphFile
 		}
 
+		hashes[i] = fi.newHash()
 		offset := fi.offsets[OIDLookupChunk] + int64(idx)*int64(fi.objSize)
-		if _, err := hashes[i].ReadFrom(io.NewSectionReader(fi.reader, offset, int64(hashes[i].Size()))); err != nil {
+		if _, err := hashes[i].ReadFrom(io.NewSectionReader(fi.reader, offset, int64(fi.objSize))); err != nil {
 			return nil, err
 		}
 	}
@@ -648,9 +743,10 @@ func (fi *fileIndex) Hashes() []plumbing.Hash {
 
 	for i := uint32(0); i < fi.fanout[0xff]; i++ {
 		h := &hashes[i+fi.minimumNumberOfHashes]
-		offset := fi.offsets[OIDLookupChunk] + int64(i)*int64(h.Size())
-		n, err := h.ReadFrom(io.NewSectionReader(fi.reader, offset, int64(h.Size())))
-		if err != nil || n < int64(h.Size()) {
+		*h = fi.newHash()
+		offset := fi.offsets[OIDLookupChunk] + int64(i)*int64(fi.objSize)
+		n, err := h.ReadFrom(io.NewSectionReader(fi.reader, offset, int64(fi.objSize)))
+		if err != nil || n < int64(fi.objSize) {
 			return nil
 		}
 	}
