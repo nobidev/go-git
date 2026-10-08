@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-git/go-git/v6/plumbing"
 	commitgraph "github.com/go-git/go-git/v6/plumbing/format/commitgraph"
+	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 )
@@ -59,14 +60,24 @@ func (gci *graphCommitNodeIndex) Get(hash plumbing.Hash) (CommitNode, error) {
 		}
 	}
 
-	// Fallback to loading full commit object
-	commit, err := object.GetCommit(gci.s, hash)
+	// Fallback to loading the commit object
+	obj, err := gci.s.EncodedObject(plumbing.CommitObject, hash)
+	if err != nil {
+		return nil, err
+	}
+
+	expected := formatcfg.SHA1
+	if hash.Size() == formatcfg.SHA256.Size() {
+		expected = formatcfg.SHA256
+	}
+	commit, err := decodeTraversalCommit(obj, hash, expected)
 	if err != nil {
 		return nil, err
 	}
 
 	return &objectCommitNode{
 		nodeIndex: gci,
+		s:         gci.s,
 		commit:    commit,
 	}, nil
 }
@@ -127,8 +138,22 @@ func (c *graphCommitNode) GenerationV2() uint64 {
 	return c.commitData.GenerationV2
 }
 
-func (c *graphCommitNode) Commit() (*object.Commit, error) {
-	return object.GetCommit(c.gci.s, c.hash)
+func (c *graphCommitNode) Commit() (*object.Commit, error) { return object.GetCommit(c.gci.s, c.hash) }
+
+func (c *graphCommitNode) authorTime() (time.Time, error) {
+	obj, err := c.gci.s.EncodedObject(plumbing.CommitObject, c.hash)
+	if err != nil {
+		return time.Time{}, err
+	}
+	expected := formatcfg.SHA1
+	if c.hash.Size() == formatcfg.SHA256.Size() {
+		expected = formatcfg.SHA256
+	}
+	commit, err := decodeTraversalCommit(obj, c.hash, expected)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return commit.AuthorWhen(), nil
 }
 
 func (c *graphCommitNode) String() string {

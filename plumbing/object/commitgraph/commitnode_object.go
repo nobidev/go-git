@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
+	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 )
@@ -14,23 +15,36 @@ import (
 // objectCommitNode implements the CommitNode interface.
 type objectCommitNode struct {
 	nodeIndex CommitNodeIndex
-	commit    *object.Commit
+	s         storer.EncodedObjectStorer
+	commit    *traversalCommit
 }
 
 // NewObjectCommitNodeIndex returns CommitNodeIndex implementation that uses
-// only object storage to load the nodes
+// only object storage to load the nodes. Get captures traversal fields at lookup
+// time; Commit loads a fresh full object. Mutating that object does not update
+// the node's traversal snapshot.
 func NewObjectCommitNodeIndex(s storer.EncodedObjectStorer) CommitNodeIndex {
 	return &objectCommitNodeIndex{s}
 }
 
 func (oci *objectCommitNodeIndex) Get(hash plumbing.Hash) (CommitNode, error) {
-	commit, err := object.GetCommit(oci.s, hash)
+	obj, err := oci.s.EncodedObject(plumbing.CommitObject, hash)
+	if err != nil {
+		return nil, err
+	}
+
+	expected := formatcfg.SHA1
+	if hash.Size() == formatcfg.SHA256.Size() {
+		expected = formatcfg.SHA256
+	}
+	commit, err := decodeTraversalCommit(obj, hash, expected)
 	if err != nil {
 		return nil, err
 	}
 
 	return &objectCommitNode{
 		nodeIndex: oci,
+		s:         oci.s,
 		commit:    commit,
 	}, nil
 }
@@ -44,7 +58,7 @@ type objectCommitNodeIndex struct {
 }
 
 func (c *objectCommitNode) CommitTime() time.Time {
-	return c.commit.Committer.When
+	return c.commit.When()
 }
 
 func (c *objectCommitNode) ID() plumbing.Hash {
@@ -52,11 +66,11 @@ func (c *objectCommitNode) ID() plumbing.Hash {
 }
 
 func (c *objectCommitNode) Tree() (*object.Tree, error) {
-	return c.commit.Tree()
+	return object.GetTree(c.s, c.commit.Tree())
 }
 
 func (c *objectCommitNode) NumParents() int {
-	return c.commit.NumParents()
+	return len(c.commit.Parents())
 }
 
 func (c *objectCommitNode) ParentNodes() CommitNodeIter {
@@ -64,18 +78,18 @@ func (c *objectCommitNode) ParentNodes() CommitNodeIter {
 }
 
 func (c *objectCommitNode) ParentNode(i int) (CommitNode, error) {
-	if i < 0 || i >= len(c.commit.ParentHashes) {
+	if i < 0 || i >= len(c.commit.Parents()) {
 		return nil, object.ErrParentNotFound
 	}
 
 	// Note: It's necessary to go through CommitNodeIndex here to ensure
 	// that if the commit-graph file covers only part of the history we
 	// start using it when that part is reached.
-	return c.nodeIndex.Get(c.commit.ParentHashes[i])
+	return c.nodeIndex.Get(c.commit.Parents()[i])
 }
 
 func (c *objectCommitNode) ParentHashes() []plumbing.Hash {
-	return c.commit.ParentHashes
+	return c.commit.Parents()
 }
 
 func (c *objectCommitNode) Generation() uint64 {
@@ -93,5 +107,7 @@ func (c *objectCommitNode) GenerationV2() uint64 {
 }
 
 func (c *objectCommitNode) Commit() (*object.Commit, error) {
-	return c.commit, nil
+	return object.GetCommit(c.s, c.ID())
 }
+
+func (c *objectCommitNode) authorTime() (time.Time, error) { return c.commit.AuthorWhen(), nil }
